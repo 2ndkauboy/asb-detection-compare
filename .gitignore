@@ -1,0 +1,16 @@
+# Cloned Antispam Bee checkouts (produced by clone-asb.sh)
+/versions/
+
+# Per-version plugin copy each environment activates
+/wp-env/active-plugin/
+/ddev/active-plugin/
+
+# DDEV project state + downloaded WordPress core
+/ddev/.ddev/
+/ddev/wp/
+
+# Benchmark output
+/logs/
+
+# Corpus dump (large binary test data; not source)
+/dumps/

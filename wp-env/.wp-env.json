@@ -1,0 +1,14 @@
+{
+	"plugins": [],
+	"mappings": {
+		"wp-content/plugins/antispam-bee": "./active-plugin",
+		"wp-content/mu-plugins": "../mu-plugins",
+		"wp-content/asb-lib": "../lib",
+		"wp-content/asb-config": "../config",
+		"wp-content/asb-dumps": "../dumps"
+	},
+	"config": {
+		"WP_DEBUG": false,
+		"WP_DEBUG_LOG": false
+	}
+}
