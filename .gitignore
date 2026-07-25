@@ -18,3 +18,7 @@
 # Transient driver/comparer copies made by ddev scripts at runtime
 /ddev/asb-driver.php
 /ddev/asb-comparer.php
+
+# Personal / local Claude Code config (not shared)
+/.claude/settings.local.json
+/CLAUDE.local.md
