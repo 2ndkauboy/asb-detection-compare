@@ -1,0 +1,42 @@
+name: self-test
+
+# Exercises the action end-to-end against a real Antispam Bee checkout. Runs on
+# demand and on pushes to the default branch.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mariadb:10.6
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - name: Checkout the action
+        uses: actions/checkout@v4
+
+      - name: Prepare an Antispam Bee checkout (simulated prepare branch)
+        run: |
+          git clone https://github.com/pluginkollektiv/antispam-bee.git "$RUNNER_TEMP/plugin"
+          git -C "$RUNNER_TEMP/plugin" fetch --tags --force
+          git -C "$RUNNER_TEMP/plugin" checkout v3
+
+      - name: Run spam-detection comparison
+        uses: ./
+        with:
+          plugin-dir: ${{ runner.temp }}/plugin
+          branch: prepare-3.0.0-beta.2          # -> baseline auto-resolves to 3.0.0-beta.1
+          fail-on-flips: 'false'                 # self-test: report, don't gate
+          db-host: 127.0.0.1

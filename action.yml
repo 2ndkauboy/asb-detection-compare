@@ -1,0 +1,87 @@
+name: 'Antispam Bee detection comparison'
+description: >-
+  Replay a comment corpus through the current version-preparation branch and a
+  resolved baseline release of Antispam Bee, and diff the spam/ham verdicts.
+author: 'pluginkollektiv'
+branding:
+  icon: 'shield'
+  color: 'orange'
+
+inputs:
+  php-version:
+    description: 'PHP version to run the comparison on.'
+    default: '8.2'
+  baseline-ref:
+    description: 'Explicit baseline tag/ref. When empty, it is resolved from the branch name.'
+    default: ''
+  branch:
+    description: 'Branch name used to resolve the baseline (defaults to the triggering ref).'
+    default: ''
+  plugin-dir:
+    description: 'Path to the Antispam Bee checkout / HEAD (defaults to the workspace).'
+    default: ''
+  fail-on-flips:
+    description: 'Fail the job when there is at least one spam/ham flip.'
+    default: 'true'
+  workers:
+    description: 'Parallel classifier processes.'
+    default: '2'
+  corpus-file:
+    description: 'Path to a corpus .sql dump (defaults to the bundled fixture).'
+    default: ''
+  corpus-url:
+    description: 'URL to download the corpus from (.sql or .sql.gz). Overrides the bundled fixture. Use a secret for release runs.'
+    default: ''
+  corpus-auth:
+    description: 'Optional Authorization header value used when downloading corpus-url (e.g. "Bearer <token>").'
+    default: ''
+  db-host:
+    description: 'MySQL host. Use 127.0.0.1 for a service on the runner, or the service name for a container job.'
+    default: '127.0.0.1'
+  db-port:
+    description: 'MySQL port.'
+    default: '3306'
+  db-user:
+    description: 'MySQL root user.'
+    default: 'root'
+  db-pass:
+    description: 'MySQL root password.'
+    default: 'root'
+
+outputs:
+  baseline:
+    description: 'The baseline tag the branch was compared against.'
+    value: ${{ steps.compare.outputs.baseline }}
+  flips:
+    description: 'Number of spam/ham decision flips between baseline and HEAD.'
+    value: ${{ steps.compare.outputs.flips }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up PHP + WP-CLI
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ inputs.php-version }}
+        extensions: mysqli
+        tools: composer, wp-cli
+        coverage: none
+
+    - name: Compare spam detection
+      id: compare
+      shell: bash
+      env:
+        ASB_ACTION_DIR: ${{ github.action_path }}
+        ASB_PLUGIN_DIR: ${{ inputs.plugin-dir }}
+        ASB_BRANCH: ${{ inputs.branch }}
+        ASB_BASELINE_REF: ${{ inputs.baseline-ref }}
+        FAIL_ON_FLIPS: ${{ inputs.fail-on-flips }}
+        WORKERS: ${{ inputs.workers }}
+        CORPUS_FILE: ${{ inputs.corpus-file }}
+        CORPUS_URL: ${{ inputs.corpus-url }}
+        CORPUS_AUTH: ${{ inputs.corpus-auth }}
+        DB_HOST: ${{ inputs.db-host }}
+        DB_PORT: ${{ inputs.db-port }}
+        DB_ROOT_USER: ${{ inputs.db-user }}
+        DB_ROOT_PASS: ${{ inputs.db-pass }}
+      run: bash "$ASB_ACTION_DIR/scripts/ci-compare.sh"

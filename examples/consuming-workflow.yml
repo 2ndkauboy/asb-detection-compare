@@ -1,0 +1,58 @@
+# Example: the workflow the `pluginkollektiv/antispam-bee` repo would add as
+# `.github/workflows/spam-detection-comparison.yml`.
+#
+# Two tiers:
+#   • Pull requests            -> fast smoke check against the bundled fixture,
+#                                 compared to the PR's base branch.
+#   • prepare-* / release push -> thorough check against the FULL corpus dump
+#                                 downloaded from a secret, compared to the
+#                                 resolved baseline release.
+#
+# Security: pull_request runs (including from forks) never receive secrets, so
+# they always fall back to the bundled fixture. Only trusted pushes to
+# prepare-* branches use the private dump.
+
+name: Spam-detection comparison
+
+on:
+  pull_request:
+    branches: [ v3, main, master ]
+  push:
+    branches:
+      - 'prepare-*'
+      - 'chore/prepare-*'
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mariadb:10.6
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # full history/tags for baseline resolution
+
+      - name: Compare spam detection
+        # Published at 2ndkauboy/asb-detection-compare for now; change to
+        # pluginkollektiv/asb-detection-compare if it is transferred to the org.
+        uses: 2ndkauboy/asb-detection-compare@v1
+        with:
+          # PR: compare against the PR's base branch. Prepare push: leave empty
+          # so the baseline is resolved from the branch name (semver).
+          baseline-ref: ${{ github.event_name == 'pull_request' && github.base_ref || '' }}
+          # PR: bundled fixture (no URL). Prepare push: full dump from the secret
+          # (falls back to the fixture if the secret is not configured).
+          corpus-url: ${{ github.event_name == 'push' && secrets.ASB_CORPUS_URL || '' }}
+          corpus-auth: ${{ github.event_name == 'push' && secrets.ASB_CORPUS_AUTH || '' }}
+          fail-on-flips: 'true'

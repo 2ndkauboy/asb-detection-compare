@@ -126,3 +126,60 @@ Place a comment dump at `dumps/comments.sql.gz`. It must contain a
 `<prefix>comments` table and its matching `<prefix>commentmeta` (prefix `wp_`).
 The dump is gitignored (it is large binary test data). Override the path with
 `ASB_DUMP=/path/to/dump.sql.gz ./ddev/setup.sh`.
+
+## GitHub Action (CI)
+
+The same comparison also runs in CI as a reusable action, so version-preparation
+branches are checked automatically. It reuses this repo's `lib/`, `mu-plugins/`
+and `config/` — there is no separate copy — but uses a **lean stack** (a MySQL
+service + `wp-cli`, no DDEV/wp-env) and a small **bundled corpus**
+(`fixtures/corpus.sql`) instead of the large local dump.
+
+- `action.yml` — composite action (sets up PHP + WP-CLI, runs the CI runner).
+- `scripts/ci-compare.sh` — the runner: resolve baseline → build both plugin
+  builds → install WP → import the corpus → classify each → diff → job summary.
+- `scripts/resolve-baseline.php` — maps a branch name to the baseline tag.
+- `.github/workflows/self-test.yml` — exercises the action end-to-end.
+- `examples/consuming-workflow.yml` — what `pluginkollektiv/antispam-bee` adds.
+
+### When it runs (two tiers)
+
+The consuming workflow runs the comparison at two levels:
+
+- **Pull requests** → a fast smoke check against the small **bundled fixture**
+  (`fixtures/corpus.sql`), compared to the PR's base branch (`baseline-ref:
+  github.base_ref`).
+- **`prepare-*` / `chore/prepare-*` pushes** → a thorough check against the
+  **full corpus dump** downloaded from a secret (`corpus-url`), compared to the
+  resolved baseline release.
+
+This is security-sound: `pull_request` runs (including from forks) never receive
+secrets, so they always fall back to the bundled fixture; only trusted pushes to
+prepare branches use the private dump. If the secret is unset, prepare pushes
+gracefully fall back to the fixture too.
+
+### Baseline selection
+
+The prepared version is parsed from the branch name (`chore/prepare-3.0.0-beta.2`
+→ `3.0.0-beta.2`) and the baseline tag is chosen semver-aware:
+
+- **Prerelease target** (`-beta`/`-rc`) → the latest earlier prerelease of the
+  same `X.Y.Z` (e.g. `3.0.0-beta.2` → `3.0.0-beta.1`). This is the "while
+  developing v3, compare against the latest 3.0.0 beta/RC" case. If there is no
+  earlier prerelease yet, it falls back to the latest stable release.
+- **Stable target** (e.g. `2.11.13`) → the latest earlier **stable** release
+  (`2.11.12`). This is the "compare against the latest released version" case.
+
+Override with the `baseline-ref` input when needed (e.g. `prepare-3.0.0` stable,
+where you may want the last RC rather than the last 2.x stable).
+
+### Inputs / outputs
+
+Key inputs: `fail-on-flips` (default `true` — spam/ham flips fail the check;
+reason-only differences stay informational), `php-version`, `workers`baseline-ref`, `corpus-file`, `corpus-url` / `corpus-auth` (download the corpus
+from a secret URL; `.sql` or `.sql.gz`), and the `db-*` connection settings.
+Outputs: `baseline` (the resolved tag) and `flips` (the flip count). Results are
+written to the job summary as a table plus the full comparison report.
+
+Configure the release-tier dump in `antispam-bee` as secrets `ASB_CORPUS_URL`
+(and optionally `ASB_CORPUS_AUTH`, e.g. `Bearer <token>`, for a private asset).

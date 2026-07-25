@@ -14,3 +14,7 @@
 
 # Corpus dump (large binary test data; not source)
 /dumps/
+
+# Transient driver/comparer copies made by ddev scripts at runtime
+/ddev/asb-driver.php
+/ddev/asb-comparer.php
