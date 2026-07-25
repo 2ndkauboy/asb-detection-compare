@@ -72,12 +72,38 @@ WORKERS=8 ./ddev/run-version.sh norm     # -> wp_norm_*
   worker** (`0` = whole corpus, the default).
 - `WORKERS` (env, default `1`) sets the number of parallel MOD-sharded
   classifier processes; use e.g. `WORKERS=8` for a full-corpus run.
+- `ASB_REFRESH` (env, default `0`) — see [Snapshot caching](#snapshot-caching).
 - `compare.sh <old-label> <new-label> <env>` — `env` is `ddev` or `wp-env`
   (whichever backend holds the snapshots).
 
 `compare.sh` prints the verdict counts, the **spam/ham flips** (where the two
 versions disagree on the decision — the signal), and a **reason-transition
 table** (same decision, different rule — the noise).
+
+## Snapshot caching
+
+Classifying the full corpus takes ~20–30 min, so re-running the same baseline
+(e.g. `v3` or `3.0.0-beta.1`) for every new PR comparison is wasted work.
+`run-version.sh` therefore **reuses an existing snapshot by default**: a full run
+records the version's git SHA and row count in a `wp_asb_snapshot_meta` table,
+and a later run for the same label **skips classification** when
+
+- the label's snapshot tables exist and the row count is intact, **and**
+- the recorded git SHA matches the current `versions/<label>` checkout.
+
+The SHA check means a moved branch is re-classified instead of served stale,
+while immutable tags reuse forever. Only full runs (`limit = 0`) are cached or
+reused — partial/benchmark runs always classify.
+
+Force a fresh run with `ASB_REFRESH=1 ./ddev/run-version.sh <label>` (e.g. after
+re-cloning a branch to a new commit). Typical PR-vs-baseline flow:
+
+```bash
+./clone-asb.sh mypr feat/my-branch v3 v3
+WORKERS=8 ./ddev/run-version.sh mypr   # classifies the PR
+WORKERS=8 ./ddev/run-version.sh v3     # instant if v3 is already cached
+./compare.sh mypr v3 ddev
+```
 
 ## Benchmarking DDEV vs. wp-env
 

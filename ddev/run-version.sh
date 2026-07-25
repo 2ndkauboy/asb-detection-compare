@@ -13,8 +13,12 @@
 #           Used by the benchmark for a fixed-size slice.
 #
 # Env:
-#   WORKERS   Parallel classifier processes (MOD-sharded, default 1). Use e.g.
-#             WORKERS=8 for a full-corpus run; keep 1 for a deterministic bench.
+#   WORKERS      Parallel classifier processes (MOD-sharded, default 1). Use e.g.
+#                WORKERS=8 for a full-corpus run; keep 1 for a deterministic bench.
+#   ASB_REFRESH  1 = always re-classify. Default 0 = reuse a cached snapshot when
+#                one exists for this label whose recorded git SHA matches the
+#                current checkout and whose row count is intact. Only full runs
+#                (limit=0) are cached and reused; partial runs always classify.
 set -euo pipefail
 
 LABEL="${1:?usage: ./ddev/run-version.sh <label> [limit]}"
@@ -38,6 +42,28 @@ if [ ! -d "$VERSION_DIR" ]; then
 fi
 
 cd "$SCRIPT_DIR"
+
+# Version fingerprint used both to validate the cache and to stamp new snapshots.
+VERSION_SHA="$(git -C "$VERSION_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+
+# --- Snapshot cache -------------------------------------------------------
+# Reuse a previously computed full-corpus snapshot for this label when it was
+# produced from the same commit and is still intact — baselines like `v3` or
+# `3.0.0-beta.1` then cost nothing to "re-run". Keyed on the git SHA (not just
+# the label) so a moved branch is re-classified instead of served stale.
+REFRESH="${ASB_REFRESH:-0}"
+if [ "$REFRESH" != "1" ] && [ "$LIMIT" = "0" ]; then
+	meta="$(ddev mysql -N -e "SELECT git_sha, comment_count FROM db.wp_asb_snapshot_meta WHERE label='${LABEL}'" 2>/dev/null || true)"
+	cached_sha="$(printf '%s' "$meta" | awk '{print $1}')"
+	cached_count="$(printf '%s' "$meta" | awk '{print $2}')"
+	if [ -n "$cached_sha" ] && [ "$cached_sha" = "$VERSION_SHA" ]; then
+		live_count="$(ddev mysql -N -e "SELECT COUNT(*) FROM db.wp_${LABEL}_comments" 2>/dev/null | tr -d '[:space:]' || true)"
+		if [ -n "$live_count" ] && [ "$live_count" = "$cached_count" ]; then
+			echo "== [$LABEL] cached snapshot present (sha ${VERSION_SHA:0:7}, ${live_count} comments) — reusing; set ASB_REFRESH=1 to force a re-run. =="
+			exit 0
+		fi
+	fi
+fi
 
 echo "== [$LABEL] install plugin build =="
 rm -rf "$PLUGIN_DIR"
@@ -76,6 +102,9 @@ for p in "${pids[@]}"; do wait "$p" || classify_status=1; done
 if [ "$classify_status" -ne 0 ]; then echo "!! a classify worker failed" >&2; exit 1; fi
 
 echo "== [$LABEL] snapshot results -> wp_${LABEL}_comments / wp_${LABEL}_commentmeta =="
+# The covering index (comment_id, meta_key, meta_value prefix) makes the
+# comparer's per-side load query index-only; without it a cold diff can stall
+# for many minutes on random meta_value reads.
 ddev mysql -e "
 	DROP TABLE IF EXISTS db.wp_${LABEL}_comments;
 	DROP TABLE IF EXISTS db.wp_${LABEL}_commentmeta;
@@ -83,7 +112,24 @@ ddev mysql -e "
 	INSERT INTO db.wp_${LABEL}_comments SELECT * FROM db.wp_comments;
 	CREATE TABLE db.wp_${LABEL}_commentmeta LIKE db.wp_commentmeta;
 	INSERT INTO db.wp_${LABEL}_commentmeta SELECT * FROM db.wp_commentmeta;
+	ALTER TABLE db.wp_${LABEL}_commentmeta ADD INDEX idx_asb_cov (comment_id, meta_key, meta_value(64));
 "
 
 count="$(ddev mysql -N -e "SELECT COUNT(*) FROM db.wp_${LABEL}_comments" 2>/dev/null | tr -d '[:space:]')"
+
+# Record the cache fingerprint for full runs so a later run with the same commit
+# can skip re-classification (see the snapshot-cache block above).
+if [ "$LIMIT" = "0" ]; then
+	ddev mysql -e "
+		CREATE TABLE IF NOT EXISTS db.wp_asb_snapshot_meta (
+			label VARCHAR(191) PRIMARY KEY,
+			git_sha VARCHAR(64),
+			comment_count INT,
+			created_at DATETIME
+		);
+		REPLACE INTO db.wp_asb_snapshot_meta (label, git_sha, comment_count, created_at)
+			VALUES ('${LABEL}', '${VERSION_SHA}', ${count:-0}, NOW());
+	"
+fi
+
 echo "== [$LABEL] done: ${count:-?} comments snapshotted. Compare with:  ../compare.sh <other> $LABEL ddev =="
