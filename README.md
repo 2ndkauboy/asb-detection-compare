@@ -162,15 +162,21 @@ service + `wp-cli`, no DDEV/wp-env) and a small **bundled corpus**
 (`fixtures/corpus.sql`) instead of the large local dump.
 
 - `action.yml` — composite action (sets up PHP + WP-CLI, runs the CI runner).
-- `scripts/ci-compare.sh` — the runner: resolve baseline → build both plugin
-  builds → install WP → import the corpus → classify each → diff → job summary.
+- `scripts/ci-compare.sh` — the runner: resolve baseline → install WP → import
+  the corpus → shard it → classify HEAD → reuse or classify the baseline → diff
+  → job summary. See [Baseline snapshots](#baseline-snapshots).
 - `scripts/resolve-baseline.php` — maps a branch name to the baseline tag.
 - `scripts/build-fixture.php` — regenerates `fixtures/corpus.sql` from a real
   corpus, stratified by `antispam_bee_reason` + `comment_type` (≤10 rows each)
   with PII removed (synthetic author/e-mail/IP everywhere, synthetic ham
   content; spam content/URLs kept). See its header for the extraction query.
+- `scripts/export-snapshot.php` — writes a pass's verdicts as a pseudonymous
+  snapshot; `scripts/verify-snapshot.php` decides whether a published one may be
+  reused. `lib/snapshot-format.php` holds the format and its privacy invariant.
 - `.github/workflows/self-test.yml` — exercises the action end-to-end.
 - `examples/consuming-workflow.yml` — what `pluginkollektiv/antispam-bee` adds.
+- `examples/attach-snapshot-on-release.yml` — the other half of the snapshot
+  chain: attaches a release's verdict snapshot so the next run can reuse it.
 
 ### When it runs (three tiers)
 
@@ -220,9 +226,103 @@ reason-only differences stay informational), `php-version`, `workers`,
 `baseline-ref`, `corpus-file` (a `.sql` or `.sql.gz` dump; the release tier
 points this at the decrypted corpus), and `corpus-url` / `corpus-auth` (an
 alternative: download the corpus from a URL, `.sql` or `.sql.gz`), plus the
-`db-*` connection settings. Outputs: `baseline` (the resolved tag) and `flips`
-(the flip count). Results are written to the job summary as a table plus the
-full comparison report.
+`db-*` connection settings, plus the snapshot settings below
+(`use-baseline-snapshot`, `snapshot-repo`, `snapshot-salt`, `wp-version`,
+`corpus-id`, `corpus-label`, `max-flips-listed`). Outputs: `baseline` (the
+resolved tag), `baseline-sha`, `baseline-source`, `flips`, `compared`,
+`only-in-baseline`, `only-in-head`, `reason-diffs`, and `snapshot-file` (this
+run's own snapshot, for the caller to upload). Results are written to the job
+summary as a table plus the full comparison report.
+
+### Baseline snapshots
+
+Classifying the full corpus takes ~20–30 minutes, and half of every run is spent
+re-deriving something that never changes: how the *baseline release* classifies
+that corpus. So a run publishes its verdicts, and later runs read them back.
+
+The chain sustains itself, with no separate warm-up job:
+
+1. A `prepare-3.0.0-beta.2` push classifies the prepared version and writes its
+   verdicts to `snapshot-file`; the workflow uploads that as an artifact.
+2. When `3.0.0-beta.2` is released, `attach-snapshot-on-release.yml` attaches
+   that artifact to the release.
+3. The next prepare run resolves its baseline to `3.0.0-beta.2`, finds the asset
+   on that release, and **skips the baseline classification entirely** — one
+   pass per run instead of two.
+
+Release assets were chosen over the Actions cache deliberately: they are
+immutable, never evicted, and readable from any branch. An Actions cache is
+scoped to the branch that wrote it (falling back only to the base and default
+branches), so a cache warmed on `v3` is invisible to exactly the `prepare-*`
+pushes that need it most.
+
+Only tags are looked up — a branch tip moves, and a snapshot only means anything
+for the exact commit it came from. PR runs (baseline = a branch, corpus = the
+bundled fixture) therefore just classify both sides; on the fixture that costs
+seconds.
+
+**What is in a snapshot.** Exactly the three fields the comparer reads, one row
+per comment:
+
+```
+0af31c9b2d5e7a41	spam	asb-regexp%2Casb-bbcode
+1b7c3f90ab2d4e15	1	\N
+```
+
+a pseudonymous id, the `comment_approved` status, and the matched rule slugs.
+No content, author, e-mail, IP or date — those are never read in the first
+place. A full 332k-comment corpus comes to about 3 MB gzipped. Both the status *and* the reason are needed: Antispam Bee records a
+reason whenever a rule matched, including on comments that stay ham, so "has a
+reason" is not the same as "is spam".
+
+**Why publishing it is safe.** The pseudonym is `HMAC-SHA256` of the *corpus row
+id* — a surrogate key that means nothing outside the dump it came from. Even
+with the salt disclosed, a pseudonym cannot be joined against anything an
+outsider holds. That is the invariant the design rests on, and
+`lib/snapshot-format.php` states it: **never derive the pseudonym from a
+personal identifier** (e-mail, IP, URL) — for those, salt secrecy would be the
+only protection and a truncated hash over a guessable domain is brute-forceable.
+The salt itself is derived from the corpus fingerprint, so two runs over the same
+corpus produce joinable ids with no shared secret; `snapshot-salt` can add one
+anyway. What a published snapshot does disclose is aggregate composition — the
+spam/ham ratio and rule-hit distribution of the corpus.
+
+Two rules the runner enforces so this cannot erode:
+
+- The snapshot output directory is written to by nothing else and is checked for
+  strays before the path is handed to the caller. The scratch directory beside it
+  holds the decrypted corpus; uploading that would publish the dump.
+- A snapshot is marked publishable only when it is both pseudonymous **and**
+  cluster-sharded (below). An unsalted local export is refused.
+
+**When a published snapshot is reused.** Its manifest records the conditions it
+was produced under, split by whether they can change a verdict:
+
+- *Hard* — plugin commit, corpus fingerprint, option fixture, classification
+  harness, shard mode. Folded into one `hard_fp`; any mismatch means the
+  snapshot describes a different experiment, and the baseline is re-classified.
+- *Soft* — WordPress core version, PHP minor, worker count. Recorded and
+  reported as a warning in the job summary, but not disqualifying. Pin
+  `wp-version` in the consuming workflow so core releases do not quietly drift;
+  bumping it invalidates every snapshot, which is the point.
+
+Corpus identity is computed from the *imported rows* (an order-independent
+checksum), not from the dump file: a dump regenerated by `mysqldump` has
+different bytes every time, which would make every lookup miss silently — and a
+miss only looks slow, never broken.
+
+**Determinism is a precondition.** Some rules read the site database as it fills:
+`DbSpam` matches a previous spam entry by IP/e-mail/URL, and `ApprovedEmail`
+trusts an address that already has an approved comment. Under plain
+`MOD(comment_ID)` sharding those comments land on racing workers, so a verdict
+can depend on interleaving. That is invisible when both sides run in the same
+job, but a stored baseline compared against a fresh HEAD would turn it into
+phantom flips on a gating check. The runner therefore builds the identity-cluster
+shard map (`lib/build-shards.php`) and classifies with it: whole clusters stay on
+one worker in `comment_ID` order, which makes the result deterministic *and*
+independent of the worker count.
+
+Set `use-baseline-snapshot: 'false'` to force a full two-pass run.
 
 ### Providing the release corpus (encrypted)
 

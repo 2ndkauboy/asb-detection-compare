@@ -18,8 +18,14 @@
  *
  * Connection details are overridable via ASB_OLD_* / ASB_NEW_* env variables.
  *
+ * Either side can instead be read from a snapshot file (ASB_OLD_FILE /
+ * ASB_NEW_FILE, see `lib/snapshot-format.php`), which is how CI compares a
+ * freshly classified HEAD against a baseline published as a release asset.
+ *
  * @package AntispamBee\Comparison
  */
+
+require_once __DIR__ . '/snapshot-format.php';
 
 class AntispamPluginStatComparer {
 
@@ -30,9 +36,18 @@ class AntispamPluginStatComparer {
 	 */
 	private $sites;
 
+	/**
+	 * Snapshot manifests of the sides that were read from a file, keyed by
+	 * version label. Sides read from a database have no manifest.
+	 *
+	 * @var array<string, array<string, mixed>>
+	 */
+	private $manifests = [];
+
 	public function __construct() {
 		$this->sites = [
 			'old' => [
+				'file'   => getenv( 'ASB_OLD_FILE' ) ?: '',
 				'host'   => getenv( 'ASB_OLD_DB_HOST' ) ?: 'ddev-asb-2-db',
 				'port'   => (int) ( getenv( 'ASB_OLD_DB_PORT' ) ?: 3306 ),
 				'name'   => getenv( 'ASB_OLD_DB_NAME' ) ?: 'db',
@@ -41,6 +56,7 @@ class AntispamPluginStatComparer {
 				'prefix' => getenv( 'ASB_OLD_PREFIX' ) ?: 'wp_',
 			],
 			'new' => [
+				'file'   => getenv( 'ASB_NEW_FILE' ) ?: '',
 				'host'   => getenv( 'ASB_NEW_DB_HOST' ) ?: 'ddev-asb-3-db',
 				'port'   => (int) ( getenv( 'ASB_NEW_DB_PORT' ) ?: 3306 ),
 				'name'   => getenv( 'ASB_NEW_DB_NAME' ) ?: 'db',
@@ -52,10 +68,79 @@ class AntispamPluginStatComparer {
 	}
 
 	/**
-	 * Load the verdicts for one site, keyed by original (source) comment id.
+	 * Load the verdicts for one side, from a snapshot file when one is
+	 * configured for it, otherwise from its database.
+	 *
+	 * The choice is per side, so a baseline restored from a release asset can be
+	 * compared against a HEAD that is still sitting in the live tables.
+	 *
+	 * @param string $which 'old' or 'new'.
+	 * @return array<string, array{status: string, reason: ?string}>
+	 */
+	private function loadSide( string $which ): array {
+		$site = $this->sites[ $which ];
+
+		if ( '' !== $site['file'] ) {
+			$snapshot                  = asb_snapshot_read( $site['file'] );
+			$this->manifests[ $which ] = $snapshot['manifest'];
+
+			return $snapshot['verdicts'];
+		}
+
+		return $this->loadVerdicts( $site );
+	}
+
+	/**
+	 * Fail unless the two sides can meaningfully be compared at all.
+	 *
+	 * Two snapshots salted differently have disjoint id spaces, so the
+	 * intersection is empty and every count comes out zero — which would be
+	 * reported as "0 flips" and pass a gating check. The same shape results from
+	 * a half-failed classification pass. Both must be loud failures.
+	 *
+	 * @param array<string, mixed> $old Old side verdicts.
+	 * @param array<string, mixed> $new New side verdicts.
+	 * @param int                  $compared Size of the intersection.
+	 */
+	private function assertComparable( array $old, array $new, int $compared ): void {
+		$old_check = $this->manifests['old']['salt_check'] ?? null;
+		$new_check = $this->manifests['new']['salt_check'] ?? null;
+		if ( null !== $old_check && null !== $new_check && $old_check !== $new_check ) {
+			fwrite(
+				STDERR,
+				"The two snapshots were pseudonymised with different salts, so their comment ids\n"
+				. "cannot be joined. This usually means they were produced from different corpora,\n"
+				. "or with a different snapshot-salt setting. Refusing to report a meaningless\n"
+				. "comparison.\n"
+			);
+			exit( 1 );
+		}
+
+		$ratio    = (float) ( getenv( 'ASB_MIN_OVERLAP_RATIO' ) ?: 0.99 );
+		$smaller  = min( count( $old ), count( $new ) );
+		$required = (int) floor( $ratio * $smaller );
+		if ( 0 === $compared || $compared < $required ) {
+			fwrite(
+				STDERR,
+				sprintf(
+					"Only %d of %d comments are present on both sides (%.1f%% required).\n"
+					. "The two sides do not describe the same corpus, or one classification pass\n"
+					. "is incomplete. Refusing to report a comparison over a partial overlap.\n",
+					$compared,
+					$smaller,
+					$ratio * 100
+				)
+			);
+			exit( 1 );
+		}
+	}
+
+	/**
+	 * Load the verdicts for one site from its database, keyed by original
+	 * (source) comment id.
 	 *
 	 * @param array $site Site connection descriptor.
-	 * @return array<int, array{status: string, reason: ?string}>
+	 * @return array<string, array{status: string, reason: ?string}>
 	 */
 	private function loadVerdicts( array $site ): array {
 		mysqli_report( MYSQLI_REPORT_OFF );
@@ -86,7 +171,7 @@ class AntispamPluginStatComparer {
 
 		$verdicts = [];
 		while ( $row = mysqli_fetch_assoc( $result ) ) {
-			$verdicts[ (int) $row['original_comment_id'] ] = [
+			$verdicts[ (string) $row['original_comment_id'] ] = [
 				'status' => (string) $row['status'],
 				'reason' => $row['reason'] !== null ? (string) $row['reason'] : null,
 			];
@@ -112,10 +197,12 @@ class AntispamPluginStatComparer {
 	 * @return array
 	 */
 	public function compareResults(): array {
-		$old = $this->loadVerdicts( $this->sites['old'] );
-		$new = $this->loadVerdicts( $this->sites['new'] );
+		$old = $this->loadSide( 'old' );
+		$new = $this->loadSide( 'new' );
 
 		$common = array_intersect_key( $old, $new );
+
+		$this->assertComparable( $old, $new, count( $common ) );
 
 		// Spam/ham flips are the real signal: the two versions disagree on whether
 		// the reaction is spam. Reason-only differences are mostly the v2->v3
@@ -190,9 +277,15 @@ class AntispamPluginStatComparer {
 		if ( ! $stats['flips'] ) {
 			$report[] = '  (none)';
 		}
-		foreach ( $stats['flips'] as $flip ) {
+
+		// A real regression over a large corpus can produce tens of thousands of
+		// flips, and a GitHub job summary is capped at 1 MiB — an uncapped list
+		// would cost us the whole report. The count above is the actionable part.
+		$max    = (int) ( getenv( 'ASB_MAX_FLIPS_LISTED' ) ?: 50 );
+		$listed = $max > 0 ? array_slice( $stats['flips'], 0, $max ) : $stats['flips'];
+		foreach ( $listed as $flip ) {
 			$report[] = sprintf(
-				'  #%-10d  %s=%s (%s)   %s=%s (%s)',
+				'  #%-16s  %s=%s (%s)   %s=%s (%s)',
 				$flip['comment_id'],
 				$old,
 				$flip['old']['status'],
@@ -201,6 +294,9 @@ class AntispamPluginStatComparer {
 				$flip['new']['status'],
 				$flip['new']['reason'] ?? '-'
 			);
+		}
+		if ( count( $listed ) < count( $stats['flips'] ) ) {
+			$report[] = sprintf( '  … and %d more (raise ASB_MAX_FLIPS_LISTED to see them)', count( $stats['flips'] ) - count( $listed ) );
 		}
 		$report[] = '';
 
@@ -222,5 +318,14 @@ class AntispamPluginStatComparer {
 // Run when invoked directly on the CLI.
 if ( PHP_SAPI === 'cli' && isset( $argv ) && realpath( $argv[0] ) === realpath( __FILE__ ) ) {
 	$comparer = new AntispamPluginStatComparer();
-	echo $comparer->generateReport( $comparer->compareResults() );
+	$stats    = $comparer->compareResults();
+	echo $comparer->generateReport( $stats );
+
+	// Machine-readable counts for callers that would otherwise have to scrape the
+	// prose above with a regex.
+	$stats_file = getenv( 'ASB_STATS_FILE' ) ?: '';
+	if ( '' !== $stats_file ) {
+		unset( $stats['flips'], $stats['reason_transitions'] );
+		file_put_contents( $stats_file, json_encode( $stats, JSON_UNESCAPED_SLASHES ) . "\n" );
+	}
 }
