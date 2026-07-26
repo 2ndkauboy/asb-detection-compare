@@ -165,6 +165,10 @@ service + `wp-cli`, no DDEV/wp-env) and a small **bundled corpus**
 - `scripts/ci-compare.sh` — the runner: resolve baseline → build both plugin
   builds → install WP → import the corpus → classify each → diff → job summary.
 - `scripts/resolve-baseline.php` — maps a branch name to the baseline tag.
+- `scripts/build-fixture.php` — regenerates `fixtures/corpus.sql` from a real
+  corpus, stratified by `antispam_bee_reason` + `comment_type` (≤10 rows each)
+  with PII removed (synthetic author/e-mail/IP everywhere, synthetic ham
+  content; spam content/URLs kept). See its header for the extraction query.
 - `.github/workflows/self-test.yml` — exercises the action end-to-end.
 - `examples/consuming-workflow.yml` — what `pluginkollektiv/antispam-bee` adds.
 
