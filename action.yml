@@ -47,14 +47,69 @@ inputs:
   db-pass:
     description: 'MySQL root password.'
     default: 'root'
+  wp-version:
+    description: >-
+      WordPress core version to install. Pin it to keep published baseline
+      snapshots valid across WordPress releases; "latest" tracks the newest.
+    default: 'latest'
+  use-baseline-snapshot:
+    description: >-
+      Reuse the verdict snapshot published on the baseline release instead of
+      classifying the baseline again. Falls back to classifying when there is no
+      usable snapshot.
+    default: 'true'
+  snapshot-repo:
+    description: 'Repository whose releases carry the snapshots (default: this repository).'
+    default: ''
+  snapshot-salt:
+    description: >-
+      Optional extra secret mixed into the snapshot pseudonyms. Must be identical
+      for the run that publishes a snapshot and the runs that consume it.
+    default: ''
+  corpus-id:
+    description: 'Override the computed corpus fingerprint (pins snapshot identity by hand).'
+    default: ''
+  corpus-label:
+    description: 'Cosmetic segment in the snapshot asset name (auto: "fixture" or "private").'
+    default: ''
+  max-flips-listed:
+    description: 'Cap on how many individual flips are listed in the report.'
+    default: '50'
+  github-token:
+    description: 'Token used to look up the baseline snapshot on the release.'
+    default: ${{ github.token }}
 
 outputs:
   baseline:
     description: 'The baseline tag the branch was compared against.'
     value: ${{ steps.compare.outputs.baseline }}
+  baseline-sha:
+    description: 'The commit the baseline resolved to.'
+    value: ${{ steps.compare.outputs.baseline-sha }}
+  baseline-source:
+    description: '"release-asset" when a published snapshot was reused, "classified" otherwise.'
+    value: ${{ steps.compare.outputs.baseline-source }}
   flips:
     description: 'Number of spam/ham decision flips between baseline and HEAD.'
     value: ${{ steps.compare.outputs.flips }}
+  compared:
+    description: 'Number of comments present on both sides.'
+    value: ${{ steps.compare.outputs.compared }}
+  only-in-baseline:
+    description: 'Comments classified by the baseline but not by HEAD.'
+    value: ${{ steps.compare.outputs.only-in-baseline }}
+  only-in-head:
+    description: 'Comments classified by HEAD but not by the baseline.'
+    value: ${{ steps.compare.outputs.only-in-head }}
+  reason-diffs:
+    description: 'Same decision, different rule — informational.'
+    value: ${{ steps.compare.outputs.reason-diffs }}
+  snapshot-file:
+    description: >-
+      Path to this run's own verdict snapshot, ready to be uploaded as an
+      artifact and later attached to the release. Empty when the snapshot may not
+      be published.
+    value: ${{ steps.compare.outputs.snapshot-file }}
 
 runs:
   using: 'composite'
@@ -84,4 +139,12 @@ runs:
         DB_PORT: ${{ inputs.db-port }}
         DB_ROOT_USER: ${{ inputs.db-user }}
         DB_ROOT_PASS: ${{ inputs.db-pass }}
+        ASB_WP_VERSION: ${{ inputs.wp-version }}
+        ASB_USE_BASELINE_SNAPSHOT: ${{ inputs.use-baseline-snapshot }}
+        ASB_SNAPSHOT_REPO: ${{ inputs.snapshot-repo || github.repository }}
+        ASB_SNAPSHOT_SALT: ${{ inputs.snapshot-salt }}
+        ASB_CORPUS_ID: ${{ inputs.corpus-id }}
+        ASB_CORPUS_LABEL: ${{ inputs.corpus-label }}
+        ASB_MAX_FLIPS_LISTED: ${{ inputs.max-flips-listed }}
+        GH_TOKEN: ${{ inputs.github-token }}
       run: bash "$ASB_ACTION_DIR/scripts/ci-compare.sh"

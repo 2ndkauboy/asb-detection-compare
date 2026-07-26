@@ -41,6 +41,8 @@ on:
 jobs:
   compare:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read        # look up the baseline snapshot on the release
     env:
       # Use the full corpus for prepare-* pushes and for manual runs that ask for
       # it — but only when the corpus is actually configured (else fall back to
@@ -78,6 +80,7 @@ jobs:
             -o corpus.sql.gz -d corpus.sql.gz.gpg
 
       - name: Compare spam detection
+        id: compare
         # Published at 2ndkauboy/asb-detection-compare for now; change to
         # pluginkollektiv/asb-detection-compare if it is transferred to the org.
         uses: 2ndkauboy/asb-detection-compare@v1
@@ -89,3 +92,20 @@ jobs:
           corpus-file: ${{ env.ASB_USE_FULL == 'true' && format('{0}/corpus.sql.gz', github.workspace) || '' }}
           # Manual runs can opt out of failing on flips; everything else gates.
           fail-on-flips: ${{ (github.event_name == 'workflow_dispatch' && inputs.fail_on_flips == false) && 'false' || 'true' }}
+          # Pinning WordPress keeps published snapshots valid across core
+          # releases; bump it deliberately (it invalidates every snapshot).
+          wp-version: '6.8.2'
+
+      # Keep this run's verdict snapshot. When this version is released,
+      # attach-snapshot-on-release.yml attaches it to the release, and the next
+      # prepare run reuses it as its baseline instead of classifying twice.
+      # Only full-corpus runs are worth keeping — a fixture snapshot is cheap to
+      # recompute and would just shadow the real one.
+      - name: Upload the verdict snapshot
+        if: env.ASB_USE_FULL == 'true' && steps.compare.outputs.snapshot-file != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: asb-detection-snapshot
+          path: ${{ steps.compare.outputs.snapshot-file }}
+          retention-days: 90
+          if-no-files-found: error

@@ -34,9 +34,71 @@ jobs:
           git -C "$RUNNER_TEMP/plugin" checkout v3
 
       - name: Run spam-detection comparison
+        id: first
         uses: ./
         with:
           plugin-dir: ${{ runner.temp }}/plugin
           branch: prepare-3.0.0-beta.2          # -> baseline auto-resolves to 3.0.0-beta.1
           fail-on-flips: 'false'                 # self-test: report, don't gate
           db-host: 127.0.0.1
+
+      # A run clears its snapshot output directory on startup, so the first
+      # run's file has to be moved aside before a second run reuses it.
+      - name: Preserve the first snapshot
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/kept"
+          cp "${{ steps.first.outputs.snapshot-file }}" "$RUNNER_TEMP/kept/baseline.tsv.gz"
+
+      # The snapshot this run produced is exactly what a release would carry, so
+      # feeding it back in must be accepted and must skip the baseline pass.
+      # ASB_BASELINE_SNAPSHOT is the runner's own escape hatch (there is no
+      # action input for it — real runs get their snapshot from the release).
+      - name: Reuse the snapshot as a baseline
+        id: reuse
+        env:
+          ASB_ACTION_DIR: ${{ github.workspace }}
+          ASB_PLUGIN_DIR: ${{ runner.temp }}/plugin
+          ASB_BRANCH: prepare-3.0.0-beta.2
+          ASB_BASELINE_REF: 3.0.0-beta.1
+          ASB_BASELINE_SNAPSHOT: ${{ runner.temp }}/kept/baseline.tsv.gz
+          FAIL_ON_FLIPS: 'false'
+          DB_HOST: 127.0.0.1
+        run: bash "$ASB_ACTION_DIR/scripts/ci-compare.sh"
+
+      - name: Assert the snapshot round trip
+        env:
+          FIRST_SOURCE: ${{ steps.first.outputs.baseline-source }}
+          FIRST_SNAPSHOT: ${{ runner.temp }}/kept/baseline.tsv.gz
+          SECOND_SOURCE: ${{ steps.reuse.outputs.baseline-source }}
+          FIRST_COMPARED: ${{ steps.first.outputs.compared }}
+          SECOND_COMPARED: ${{ steps.reuse.outputs.compared }}
+        run: |
+          set -euo pipefail
+          fail=0
+          expect() {
+            if [ "$2" = "$3" ]; then
+              echo "ok   $1"
+            else
+              echo "FAIL $1: expected '$3', got '$2'"
+              fail=1
+            fi
+          }
+
+          expect "first run classified its baseline"  "$FIRST_SOURCE"  "classified"
+          expect "second run reused the snapshot"     "$SECOND_SOURCE" "release-asset"
+          expect "both runs compared the same corpus" "$SECOND_COMPARED" "$FIRST_COMPARED"
+
+          # A published snapshot must never carry raw corpus ids or any content:
+          # every key is a 16-hex pseudonym, and the payload is a status plus
+          # rule slugs. Checked here so a regression cannot ship quietly.
+          body="$(mktemp)"
+          zcat "$FIRST_SNAPSHOT" | tail -n +3 > "$body"
+          bad_keys="$(cut -f1 "$body" | grep -cvE '^[0-9a-f]{16}$' || true)"
+          expect "every id is a pseudonym" "$bad_keys" "0"
+          for pattern in '@' 'http' '[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+'; do
+            hits="$(grep -c "$pattern" "$body" || true)"
+            expect "no '$pattern' in the snapshot body" "$hits" "0"
+          done
+
+          exit "$fail"
