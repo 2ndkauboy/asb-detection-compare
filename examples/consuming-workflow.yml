@@ -1,16 +1,18 @@
 # Example: the workflow the `pluginkollektiv/antispam-bee` repo would add as
 # `.github/workflows/spam-detection-comparison.yml`.
 #
-# Two tiers:
+# Three tiers:
 #   • Pull requests            -> fast smoke check against the bundled fixture,
 #                                 compared to the PR's base branch.
 #   • prepare-* / release push -> thorough check against the FULL corpus dump
-#                                 downloaded from a secret, compared to the
+#                                 (decrypted in-workflow), compared to the
 #                                 resolved baseline release.
+#   • Manual (workflow_dispatch)-> run on ANY branch on demand, choosing the
+#                                 baseline and whether to use the full corpus.
 #
 # Security: pull_request runs (including from forks) never receive secrets, so
-# they always fall back to the bundled fixture. Only trusted pushes to
-# prepare-* branches use the private dump.
+# they always fall back to the bundled fixture. Only trusted events — pushes to
+# prepare-* branches and manual runs — decrypt the private dump.
 
 name: Spam-detection comparison
 
@@ -21,10 +23,29 @@ on:
     branches:
       - 'prepare-*'
       - 'chore/prepare-*'
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: 'Baseline tag or branch to compare the current branch against.'
+        required: true
+        default: 'v3'
+      full_corpus:
+        description: 'Use the full encrypted corpus (otherwise the small bundled fixture).'
+        type: boolean
+        default: true
+      fail_on_flips:
+        description: 'Fail the run if any spam/ham verdict flips.'
+        type: boolean
+        default: true
 
 jobs:
   compare:
     runs-on: ubuntu-latest
+    env:
+      # Use the full corpus for prepare-* pushes and for manual runs that ask for
+      # it — but only when the corpus is actually configured (else fall back to
+      # the bundled fixture). PRs never use it.
+      ASB_USE_FULL: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full_corpus)) && vars.ASB_CORPUS_ENC_URL != '' }}
     services:
       mysql:
         image: mariadb:10.6
@@ -43,11 +64,11 @@ jobs:
         with:
           fetch-depth: 0        # full history/tags for baseline resolution
 
-      # Release tier only: download the encrypted full corpus (public ciphertext,
-      # useless without the key) and decrypt it with the passphrase secret.
-      # Skipped when the corpus is not configured, so PRs use the bundled fixture.
+      # Download the encrypted full corpus (public ciphertext, useless without
+      # the key) and decrypt it with the passphrase secret. Runs only when the
+      # full corpus is selected and configured.
       - name: Fetch & decrypt the release corpus
-        if: github.event_name == 'push' && vars.ASB_CORPUS_ENC_URL != ''
+        if: env.ASB_USE_FULL == 'true'
         env:
           ASB_CORPUS_ENC_URL: ${{ vars.ASB_CORPUS_ENC_URL }}
           ASB_CORPUS_KEY: ${{ secrets.ASB_CORPUS_KEY }}
@@ -61,10 +82,10 @@ jobs:
         # pluginkollektiv/asb-detection-compare if it is transferred to the org.
         uses: 2ndkauboy/asb-detection-compare@v1
         with:
-          # PR: compare against the PR's base branch. Prepare push: leave empty
-          # so the baseline is resolved from the branch name (semver).
-          baseline-ref: ${{ github.event_name == 'pull_request' && github.base_ref || '' }}
-          # Release tier: the decrypted full corpus. PRs (or unconfigured): empty
-          # -> the action's bundled fixture.
-          corpus-file: ${{ (github.event_name == 'push' && vars.ASB_CORPUS_ENC_URL != '') && format('{0}/corpus.sql.gz', github.workspace) || '' }}
-          fail-on-flips: 'true'
+          # PR -> the PR's base branch. Manual -> the chosen baseline. Prepare
+          # push -> empty, so the baseline is resolved from the branch name.
+          baseline-ref: ${{ (github.event_name == 'pull_request' && github.base_ref) || (github.event_name == 'workflow_dispatch' && inputs.baseline_ref) || '' }}
+          # Full corpus when selected+configured, else the action's bundled fixture.
+          corpus-file: ${{ env.ASB_USE_FULL == 'true' && format('{0}/corpus.sql.gz', github.workspace) || '' }}
+          # Manual runs can opt out of failing on flips; everything else gates.
+          fail-on-flips: ${{ (github.event_name == 'workflow_dispatch' && inputs.fail_on_flips == false) && 'false' || 'true' }}

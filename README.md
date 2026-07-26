@@ -172,9 +172,9 @@ service + `wp-cli`, no DDEV/wp-env) and a small **bundled corpus**
 - `.github/workflows/self-test.yml` — exercises the action end-to-end.
 - `examples/consuming-workflow.yml` — what `pluginkollektiv/antispam-bee` adds.
 
-### When it runs (two tiers)
+### When it runs (three tiers)
 
-The consuming workflow runs the comparison at two levels:
+The consuming workflow runs the comparison at three levels:
 
 - **Pull requests** → a fast smoke check against the small **bundled fixture**
   (`fixtures/corpus.sql`), compared to the PR's base branch (`baseline-ref:
@@ -183,11 +183,20 @@ The consuming workflow runs the comparison at two levels:
   **full corpus dump**, decrypted in the workflow from an encrypted blob (see
   [Providing the release corpus](#providing-the-release-corpus-encrypted)),
   compared to the resolved baseline release.
+- **Manual (`workflow_dispatch`)** → run against **any branch** on demand,
+  choosing the baseline (`baseline_ref`, default `v3`), whether to use the full
+  corpus (`full_corpus`, default on) or the bundled fixture, and whether to gate
+  on flips (`fail_on_flips`). Handy for checking a feature branch against the
+  full corpus before it becomes a prepare branch.
 
 This is security-sound: `pull_request` runs (including from forks) never receive
-secrets, so they always fall back to the bundled fixture; only trusted pushes to
-prepare branches decrypt the private dump. If the corpus is not configured,
-prepare pushes gracefully fall back to the fixture too.
+secrets, so they always fall back to the bundled fixture; only trusted events —
+`prepare-*` pushes and manual runs — decrypt the private dump. If the corpus is
+not configured, those runs gracefully fall back to the fixture too.
+
+> **Note:** GitHub shows the "Run workflow" button only for workflows present on
+> the repo's default branch, and the manual run uses the workflow file from the
+> branch you pick — so the branch you dispatch on must contain this workflow.
 
 ### Baseline selection
 
