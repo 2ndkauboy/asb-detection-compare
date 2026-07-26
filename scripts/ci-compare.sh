@@ -118,22 +118,26 @@ log "Installing support mu-plugins"
 mkdir -p "$WP_DIR/wp-content/mu-plugins"
 cp "$ASB_ACTION_DIR"/mu-plugins/*.php "$WP_DIR/wp-content/mu-plugins/"
 
-# Optionally fetch the corpus from a (secret) URL instead of the bundled
-# fixture. Supports plain .sql or gzip-compressed dumps (detected by content).
+# Resolve the raw corpus source — a download from CORPUS_URL, or CORPUS_FILE
+# (the bundled fixture by default, or a file the workflow prepared, e.g. a
+# decrypted dump). Then normalise to plain SQL, accepting gzip-compressed dumps
+# from either source (so a decrypted `corpus.sql.gz` works via corpus-file too).
 if [ -n "${CORPUS_URL:-}" ]; then
 	log "Downloading corpus from CORPUS_URL"
-	dl="$WORK/corpus.download"
-	curl -fSL --retry 3 ${CORPUS_AUTH:+-H "Authorization: $CORPUS_AUTH"} -o "$dl" "$CORPUS_URL"
-	if gzip -t "$dl" 2>/dev/null; then
-		gunzip -c "$dl" > "$WORK/corpus.sql"
-		CORPUS_FILE="$WORK/corpus.sql"
-	else
-		CORPUS_FILE="$dl"
-	fi
+	raw="$WORK/corpus.download"
+	curl -fSL --retry 3 ${CORPUS_AUTH:+-H "Authorization: $CORPUS_AUTH"} -o "$raw" "$CORPUS_URL"
+else
+	raw="$CORPUS_FILE"
 fi
-if [ ! -f "$CORPUS_FILE" ]; then
-	echo "Corpus file not found: $CORPUS_FILE" >&2
+if [ ! -f "$raw" ]; then
+	echo "Corpus file not found: $raw" >&2
 	exit 1
+fi
+if gzip -t "$raw" 2>/dev/null; then
+	gunzip -c "$raw" > "$WORK/corpus.sql"
+	CORPUS_FILE="$WORK/corpus.sql"
+else
+	CORPUS_FILE="$raw"
 fi
 
 log "Creating corpus DB '$CORPUS_DB' + importing $(basename "$CORPUS_FILE")"

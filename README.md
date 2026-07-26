@@ -176,13 +176,14 @@ The consuming workflow runs the comparison at two levels:
   (`fixtures/corpus.sql`), compared to the PR's base branch (`baseline-ref:
   github.base_ref`).
 - **`prepare-*` / `chore/prepare-*` pushes** → a thorough check against the
-  **full corpus dump** downloaded from a secret (`corpus-url`), compared to the
-  resolved baseline release.
+  **full corpus dump**, decrypted in the workflow from an encrypted blob (see
+  [Providing the release corpus](#providing-the-release-corpus-encrypted)),
+  compared to the resolved baseline release.
 
 This is security-sound: `pull_request` runs (including from forks) never receive
 secrets, so they always fall back to the bundled fixture; only trusted pushes to
-prepare branches use the private dump. If the secret is unset, prepare pushes
-gracefully fall back to the fixture too.
+prepare branches decrypt the private dump. If the corpus is not configured,
+prepare pushes gracefully fall back to the fixture too.
 
 ### Baseline selection
 
@@ -202,10 +203,55 @@ where you may want the last RC rather than the last 2.x stable).
 ### Inputs / outputs
 
 Key inputs: `fail-on-flips` (default `true` — spam/ham flips fail the check;
-reason-only differences stay informational), `php-version`, `workers`baseline-ref`, `corpus-file`, `corpus-url` / `corpus-auth` (download the corpus
-from a secret URL; `.sql` or `.sql.gz`), and the `db-*` connection settings.
-Outputs: `baseline` (the resolved tag) and `flips` (the flip count). Results are
-written to the job summary as a table plus the full comparison report.
+reason-only differences stay informational), `php-version`, `workers`,
+`baseline-ref`, `corpus-file` (a `.sql` or `.sql.gz` dump; the release tier
+points this at the decrypted corpus), and `corpus-url` / `corpus-auth` (an
+alternative: download the corpus from a URL, `.sql` or `.sql.gz`), plus the
+`db-*` connection settings. Outputs: `baseline` (the resolved tag) and `flips`
+(the flip count). Results are written to the job summary as a table plus the
+full comparison report.
 
-Configure the release-tier dump in `antispam-bee` as secrets `ASB_CORPUS_URL`
-(and optionally `ASB_CORPUS_AUTH`, e.g. `Bearer <token>`, for a private asset).
+### Providing the release corpus (encrypted)
+
+The full corpus is real comments (likely PII), so it must not be public — but a
+GitHub secret caps at 48 KB, far smaller than the dump. The solution: **encrypt
+the dump once; only the passphrase is a secret.** The ciphertext is useless
+without the key, so it can be hosted at a public URL; the workflow downloads and
+decrypts it, then passes the plain dump to the action via `corpus-file`.
+
+1. **Encrypt** the dump (symmetric AES256 with a strong passphrase):
+
+   ```bash
+   gpg --batch --symmetric --cipher-algo AES256 \
+     --passphrase "$ASB_CORPUS_KEY" -o corpus.sql.gz.gpg corpus.sql.gz
+   ```
+
+2. **Host** `corpus.sql.gz.gpg` at a URL the runner can reach — e.g. a **public**
+   GitHub release asset. Public is fine: it is encrypted.
+
+3. **Configure** the consuming repo (`antispam-bee`):
+   - repository **variable** `ASB_CORPUS_ENC_URL` = the ciphertext URL (not
+     sensitive);
+   - repository **secret** `ASB_CORPUS_KEY` = the passphrase.
+
+4. The workflow's release-tier step (see `examples/consuming-workflow.yml`)
+   downloads and decrypts it:
+
+   ```yaml
+   - name: Fetch & decrypt the release corpus
+     if: github.event_name == 'push' && vars.ASB_CORPUS_ENC_URL != ''
+     env:
+       ASB_CORPUS_ENC_URL: ${{ vars.ASB_CORPUS_ENC_URL }}
+       ASB_CORPUS_KEY: ${{ secrets.ASB_CORPUS_KEY }}
+     run: |
+       curl -fSL --retry 3 -o corpus.sql.gz.gpg "$ASB_CORPUS_ENC_URL"
+       gpg --batch --quiet --yes --passphrase "$ASB_CORPUS_KEY" \
+         -o corpus.sql.gz -d corpus.sql.gz.gpg
+   ```
+
+   Then the action step sets `corpus-file` to the decrypted `corpus.sql.gz` on
+   the release tier, and leaves it empty on PRs (bundled fixture).
+
+Because the ciphertext is public, the **passphrase must be strong** — it is the
+only thing protecting the data. Rotate it by re-encrypting and updating the
+secret. `gpg` is preinstalled on GitHub-hosted runners.
