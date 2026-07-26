@@ -142,7 +142,8 @@ fi
 
 log "Creating corpus DB '$CORPUS_DB' + importing $(basename "$CORPUS_FILE")"
 wp db query "CREATE DATABASE IF NOT EXISTS \`$CORPUS_DB\`"
-{ echo "USE \`$CORPUS_DB\`;"; cat "$CORPUS_FILE"; } | wp db query
+# SET NAMES utf8mb4 so 4-byte characters (emoji in real comment content) import.
+{ echo "SET NAMES utf8mb4; USE \`$CORPUS_DB\`;"; cat "$CORPUS_FILE"; } | wp db query
 corpus_count="$(wp db query "SELECT COUNT(*) FROM \`$CORPUS_DB\`.wp_comments" --skip-column-names)"
 echo "Corpus rows: $corpus_count"
 
