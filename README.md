@@ -317,10 +317,28 @@ trusts an address that already has an approved comment. Under plain
 `MOD(comment_ID)` sharding those comments land on racing workers, so a verdict
 can depend on interleaving. That is invisible when both sides run in the same
 job, but a stored baseline compared against a fresh HEAD would turn it into
-phantom flips on a gating check. The runner therefore builds the identity-cluster
-shard map (`lib/build-shards.php`) and classifies with it: whole clusters stay on
-one worker in `comment_ID` order, which makes the result deterministic *and*
-independent of the worker count.
+phantom flips on a gating check. The runner therefore builds a shard map
+(`lib/build-shards.php`) that keeps each rule's inputs on one worker, in
+`comment_ID` order — which makes the result deterministic *and* independent of the
+worker count.
+
+Which grouping is needed depends on which rules are active, and the difference is
+dramatic on real data (`ASB_SHARD_MODE`):
+
+| mode | groups by | largest shard of the 333k corpus |
+|------|-----------|----------------------------------|
+| `identity` | transitive closure of IP + e-mail + URL | **86.6 %** |
+| `email` (default in CI) | e-mail address only | **26.1 %** |
+
+`identity` is what `DbSpam` requires, since it matches on any of the three. But
+spam campaigns reuse addresses, IPs and URLs across each other, so the transitive
+closure collapses: on the reference corpus a *single* cluster holds 81 % of all
+comments, pinning 86 % of the work onto one worker and making extra workers
+pointless. CI disables `DbSpam` (`ASB_DISABLE_DB_SPAM=1`), which leaves
+`ApprovedEmail` as the only order-dependent rule — and it keys on the e-mail
+address alone. So `email` grouping is sufficient there, and it splits evenly.
+`build-shards.php` refuses `email` unless DbSpam is actually disabled, and prints
+a warning whenever a map comes out skewed.
 
 Set `use-baseline-snapshot: 'false'` to force a full two-pass run.
 

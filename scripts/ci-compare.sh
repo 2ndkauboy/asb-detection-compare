@@ -31,6 +31,7 @@
 #   ASB_CORPUS_LABEL           Cosmetic asset-name segment (fixture/private).
 #   ASB_WP_VERSION             WordPress core version to install (default latest).
 #   ASB_MAX_FLIPS_LISTED       Cap on flips listed in the report (default 50).
+#   ASB_SHARD_MODE             Shard grouping: "email" (default) or "identity".
 set -euo pipefail
 
 ASB_ACTION_DIR="${ASB_ACTION_DIR:?ASB_ACTION_DIR is required}"
@@ -197,10 +198,17 @@ echo "Corpus rows: $corpus_count"
 # comment_ID order, which makes the outcome deterministic and independent of the
 # worker count.
 # ---------------------------------------------------------------------------
-log "Building the DbSpam-safe shard map"
+# DbSpam is disabled here, so the only order-dependent rule left is
+# ApprovedEmail, which keys on the e-mail address alone. Grouping by e-mail is
+# therefore sufficient — and far better balanced than the transitive
+# IP/e-mail/URL closure, which on real corpora collapses most of the comments
+# into one component and starves every worker but one.
+SHARD_MODE="${ASB_SHARD_MODE:-email}"
+log "Building the shard map (mode: $SHARD_MODE)"
 ASB_SRC_DB_HOST="$DB_HOST" ASB_SRC_DB_PORT="$DB_PORT" ASB_SRC_DB_NAME="$CORPUS_DB" \
 	ASB_SRC_DB_USER="$DB_ROOT_USER" ASB_SRC_DB_PASS="$DB_ROOT_PASS" ASB_SRC_PREFIX=wp_ \
-	ASB_WORKER_COUNT="$WORKERS" php "$ASB_ACTION_DIR/lib/build-shards.php"
+	ASB_WORKER_COUNT="$WORKERS" ASB_SHARD_MODE="$SHARD_MODE" ASB_DISABLE_DB_SPAM=1 \
+	php "$ASB_ACTION_DIR/lib/build-shards.php"
 
 # ---------------------------------------------------------------------------
 # 5. Fingerprint the run: what identifies this corpus, and what conditions the
@@ -237,8 +245,8 @@ harness_fp="$(cat \
 # is what a published snapshot must match; HEAD's is what this run's own
 # snapshot records, so that it validates when it becomes someone's baseline.
 hard_fp_for() {
-	printf 'schema=1\ncommit=%s\ncorpus=%s\nharness=%s\nshard=cluster\ndbspam=off\n' \
-		"$1" "$corpus_fp" "$harness_fp" | sha256sum | cut -d' ' -f1
+	printf 'schema=1\ncommit=%s\ncorpus=%s\nharness=%s\nshard=%s\ndbspam=off\n' \
+		"$1" "$corpus_fp" "$harness_fp" "$SHARD_MODE" | sha256sum | cut -d' ' -f1
 }
 hard_fp="$(hard_fp_for "$baseline_sha")"
 
@@ -350,13 +358,13 @@ export_snapshot() {
 	local out="$1" ref="$2" sha="$3"
 	local meta
 	meta="$(ASB_M_REF="$ref" ASB_M_SHA="$sha" ASB_M_HARD="$(hard_fp_for "$sha")" ASB_M_TOKEN="$corpus_token" \
-		ASB_M_SOFT="$soft_json" php -r \
+		ASB_M_SHARD="$SHARD_MODE" ASB_M_SOFT="$soft_json" php -r \
 		'echo json_encode([
 			"ref"           => getenv("ASB_M_REF"),
 			"commit_sha"    => getenv("ASB_M_SHA"),
 			"hard_fp"       => getenv("ASB_M_HARD"),
 			"corpus_token"  => getenv("ASB_M_TOKEN"),
-			"shard_mode"    => "cluster",
+			"shard_mode"    => getenv("ASB_M_SHARD"),
 			"soft"          => json_decode(getenv("ASB_M_SOFT"), true),
 		]);')"
 	DB_PASS="$DB_ROOT_PASS" php "$ASB_ACTION_DIR/scripts/export-snapshot.php" \

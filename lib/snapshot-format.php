@@ -122,11 +122,14 @@ function asb_snapshot_write( string $path, array $verdicts, array $meta ): array
 	}
 
 	// A snapshot may only become someone else's baseline when it is both
-	// pseudonymous and reproducible. Cluster sharding is what makes the
-	// order-dependent rules (DbSpam, ApprovedEmail) deterministic; a MOD-sharded
-	// run can differ between passes and must never be published.
+	// pseudonymous and reproducible. Keeping each order-dependent rule's inputs
+	// on a single worker is what makes a run reproducible: `identity` groups the
+	// transitive IP/e-mail/URL closure (needed while DbSpam is active), `email`
+	// groups by address alone (enough once DbSpam is off). A MOD-sharded run can
+	// differ between passes and must never be published.
 	$salt_check  = $meta['salt_check'] ?? 'none';
-	$publishable = 'none' !== $salt_check && 'cluster' === ( $meta['shard_mode'] ?? '' );
+	$publishable = 'none' !== $salt_check
+		&& in_array( $meta['shard_mode'] ?? '', [ 'identity', 'email' ], true );
 
 	$manifest = array_merge(
 		$meta,
