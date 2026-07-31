@@ -110,6 +110,12 @@ outputs:
       artifact and later attached to the release. Empty when the snapshot may not
       be published.
     value: ${{ steps.compare.outputs.snapshot-file }}
+  baseline-snapshot-file:
+    description: >-
+      Path to the baseline's verdict snapshot, when the baseline was a tag and had
+      to be classified in this run. Attach it to that tag's release so later runs
+      can reuse it. Empty when the baseline was already published or is a branch.
+    value: ${{ steps.compare.outputs.baseline-snapshot-file }}
 
 runs:
   using: 'composite'

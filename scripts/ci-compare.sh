@@ -71,8 +71,13 @@ summary() { [ -n "${GITHUB_STEP_SUMMARY:-}" ] && printf '%s\n' "$*" >> "$GITHUB_
 # and NOTHING but the snapshot may ever be written into it.
 WORK="${RUNNER_TEMP:-$(mktemp -d)}/asb-compare"
 SNAP_OUT="${RUNNER_TEMP:-$(dirname "$WORK")}/asb-snapshot-out"
-rm -rf "$WORK" "$SNAP_OUT"
-mkdir -p "$WORK" "$SNAP_OUT"
+# A classified baseline is just as publishable as HEAD — it describes a tag, so
+# it can be attached to that tag's release and reused forever. Kept in its own
+# directory so both can be uploaded as separate artifacts under the canonical
+# asset name.
+BASE_OUT="${RUNNER_TEMP:-$(dirname "$WORK")}/asb-baseline-snapshot-out"
+rm -rf "$WORK" "$SNAP_OUT" "$BASE_OUT"
+mkdir -p "$WORK" "$SNAP_OUT" "$BASE_OUT"
 WP_DIR="$WORK/wp"
 BASE_DIR="$WORK/baseline"
 trap 'git -C "$ASB_PLUGIN_DIR" worktree remove --force "$BASE_DIR" 2>/dev/null || true; rm -rf "$WORK"' EXIT
@@ -379,13 +384,21 @@ HEAD_SNAPSHOT="$SNAP_OUT/asb-snapshot-${CORPUS_LABEL}-${corpus_token}.tsv.gz"
 classify head "$ASB_PLUGIN_DIR"
 export_snapshot "$HEAD_SNAPSHOT" "$ASB_BRANCH" "$head_sha"
 
+baseline_classified=false
 if [ -z "$BASE_SNAPSHOT" ]; then
 	log "Checking out baseline '$ASB_BASELINE_REF' into a worktree"
 	git -C "$ASB_PLUGIN_DIR" worktree add --detach --force "$BASE_DIR" "$baseline_ish"
 	build_autoloader "$BASE_DIR"
-	BASE_SNAPSHOT="$WORK/baseline.tsv.gz"
+	# Worth publishing only when the baseline is a tag: the lookup only ever
+	# queries releases, and a branch tip moves so its verdicts are not reusable.
+	if [ "$baseline_is_tag" = "true" ]; then
+		BASE_SNAPSHOT="$BASE_OUT/asb-snapshot-${CORPUS_LABEL}-${corpus_token}.tsv.gz"
+	else
+		BASE_SNAPSHOT="$WORK/baseline.tsv.gz"
+	fi
 	classify "baseline" "$BASE_DIR"
 	export_snapshot "$BASE_SNAPSHOT" "$ASB_BASELINE_REF" "$baseline_sha"
+	baseline_classified=true
 else
 	log "Skipping the baseline classification — using the published snapshot"
 fi
@@ -411,23 +424,51 @@ only_in_head="$(stat_of only_in_new)"
 reason_diffs="$(stat_of reason_diffs)"
 
 # ---------------------------------------------------------------------------
-# 9. Publish the HEAD snapshot for the caller, but only if it is safe to.
+# 9. Offer the snapshots to the caller, but only if they are safe to publish.
 #
-# This directory gets uploaded as a workflow artifact and can end up as a public
-# release asset, so it must hold the snapshot and nothing else — the scratch dir
-# next to it contains the corpus itself.
+# These directories get uploaded as workflow artifacts and can end up as public
+# release assets, so each must hold its snapshot and nothing else — the scratch
+# dir next to them contains the corpus itself.
 # ---------------------------------------------------------------------------
-snapshot_out=""
-publishable="$(php -r \
-	'require getenv("ASB_LIB"); $m = asb_snapshot_manifest($argv[1]); echo ! empty($m["publishable"]) ? "yes" : "no";' \
-	"$HEAD_SNAPSHOT")"
-stray="$(find "$SNAP_OUT" -mindepth 1 ! -name "$(basename "$HEAD_SNAPSHOT")" | head -1)"
-if [ -n "$stray" ]; then
-	echo "!! Refusing to publish: unexpected file in the snapshot output dir: $stray" >&2
-elif [ "$publishable" != "yes" ]; then
-	echo "!! Not publishing the snapshot: it is not pseudonymous or not reproducible." >&2
-else
-	snapshot_out="$HEAD_SNAPSHOT"
+# Echoes the path when the file may be published, nothing when it may not.
+offer_snapshot() {
+	local dir="$1" file="$2" what="$3" publishable stray
+	if [ ! -f "$file" ]; then
+		return 0
+	fi
+
+	# The file must actually live in the directory whose contents we vet —
+	# otherwise the check below inspects one place while the caller uploads
+	# another, and the scratch dir (which holds the corpus) is right next door.
+	if [ "$(dirname "$file")" != "$dir" ]; then
+		return 0
+	fi
+
+	stray="$(find "$dir" -mindepth 1 ! -name "$(basename "$file")" | head -1)"
+	if [ -n "$stray" ]; then
+		echo "!! Refusing to publish the $what snapshot: unexpected file in $dir: $stray" >&2
+		return 0
+	fi
+
+	publishable="$(php -r \
+		'require getenv("ASB_LIB"); $m = asb_snapshot_manifest($argv[1]); echo ! empty($m["publishable"]) ? "yes" : "no";' \
+		"$file")"
+	if [ "$publishable" != "yes" ]; then
+		echo "!! Not publishing the $what snapshot: not pseudonymous or not reproducible." >&2
+		return 0
+	fi
+
+	printf '%s' "$file"
+}
+
+snapshot_out="$(offer_snapshot "$SNAP_OUT" "$HEAD_SNAPSHOT" "HEAD")"
+
+# The baseline snapshot describes a tag, so it belongs on that tag's release —
+# which is exactly what a later run looks for. Without this it was computed and
+# then thrown away with the scratch directory.
+baseline_snapshot_out=""
+if [ "$baseline_classified" = "true" ]; then
+	baseline_snapshot_out="$(offer_snapshot "$BASE_OUT" "$BASE_SNAPSHOT" "baseline")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -444,6 +485,7 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
 		echo "only-in-head=$only_in_head"
 		echo "reason-diffs=$reason_diffs"
 		echo "snapshot-file=$snapshot_out"
+		echo "baseline-snapshot-file=$baseline_snapshot_out"
 	} >> "$GITHUB_OUTPUT"
 fi
 
@@ -461,6 +503,9 @@ summary "- **Corpus rows:** $corpus_count (\`$CORPUS_LABEL/$corpus_token\`)"
 summary "- **Compared:** $compared"
 summary "- **Spam/ham flips:** **$flips**"
 summary "- **Reason-only differences:** $reason_diffs"
+if [ -n "$baseline_snapshot_out" ]; then
+	summary "- **Baseline snapshot produced:** attach it to the \`$ASB_BASELINE_REF\` release to make later runs single-pass"
+fi
 if [ -n "$drift_notes" ]; then
 	summary ""
 	summary "> [!WARNING]"
