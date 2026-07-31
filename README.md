@@ -240,6 +240,13 @@ Classifying the full corpus takes ~20–30 minutes, and half of every run is spe
 re-deriving something that never changes: how the *baseline release* classifies
 that corpus. So a run publishes its verdicts, and later runs read them back.
 
+Two snapshots can come out of one run. HEAD's is the obvious one, but when the
+baseline is a tag that had to be classified, **its** verdicts are equally
+publishable — they describe a released commit, which is exactly what a later run
+looks for. Both are offered (`snapshot-file`, `baseline-snapshot-file`); attaching
+the baseline one to its release is what makes the *next* comparison single-pass,
+so it is worth doing the first time a given baseline is used.
+
 The chain sustains itself, with no separate warm-up job:
 
 1. A `prepare-3.0.0-beta.2` push classifies the prepared version and writes its
