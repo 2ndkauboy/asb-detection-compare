@@ -110,6 +110,12 @@ outputs:
       artifact and later attached to the release. Empty when the snapshot may not
       be published.
     value: ${{ steps.compare.outputs.snapshot-file }}
+  report-markdown:
+    description: >-
+      Path to the comparison report rendered as Markdown, ready to post as a
+      pull-request comment. Carries an `asb-detection-compare` HTML marker so a
+      comment can be updated in place rather than posted again per run.
+    value: ${{ steps.compare.outputs.report-markdown }}
   baseline-snapshot-file:
     description: >-
       Path to the baseline's verdict snapshot, when the baseline was a tag and had

@@ -230,9 +230,20 @@ alternative: download the corpus from a URL, `.sql` or `.sql.gz`), plus the
 (`use-baseline-snapshot`, `snapshot-repo`, `snapshot-salt`, `wp-version`,
 `corpus-id`, `corpus-label`, `max-flips-listed`). Outputs: `baseline` (the
 resolved tag), `baseline-sha`, `baseline-source`, `flips`, `compared`,
-`only-in-baseline`, `only-in-head`, `reason-diffs`, and `snapshot-file` (this
-run's own snapshot, for the caller to upload). Results are written to the job
-summary as a table plus the full comparison report.
+`only-in-baseline`, `only-in-head`, `reason-diffs`, `snapshot-file` (this run's
+own snapshot, for the caller to upload), `baseline-snapshot-file`, and
+`report-markdown`. Results are written to the job summary as tables, with the
+full text report in a collapsed block.
+
+`report-markdown` is the same rendering as a file, ready to post as a
+pull-request comment — see the comment step in
+`examples/consuming-workflow.yml`. It is worth posting only for **full-corpus**
+runs: a `pull_request` run sees just the bundled fixture and would report almost
+nothing. Since full-corpus runs are `prepare-*` pushes with no PR attached, the
+example takes the target PR number as a `workflow_dispatch` input. The report
+carries an `<!-- asb-detection-compare -->` marker so the step updates its own
+previous comment instead of adding one per run, and it skips fork PRs, which
+cannot be commented on with the default read-only token.
 
 ### Baseline snapshots
 

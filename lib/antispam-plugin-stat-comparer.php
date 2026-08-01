@@ -247,6 +247,90 @@ class AntispamPluginStatComparer {
 	}
 
 	/**
+	 * Render the comparison detail as Markdown tables, for a job summary or a
+	 * pull-request comment.
+	 *
+	 * Only the comparison itself — the caller knows the run context (which
+	 * corpus, which commits, whether a published baseline was reused) and puts
+	 * its own summary above this.
+	 *
+	 * @param array $stats Result of {@see compareResults()}.
+	 */
+	public function generateMarkdown( array $stats ): string {
+		$old = getenv( 'ASB_OLD_LABEL' ) ?: 'old';
+		$new = getenv( 'ASB_NEW_LABEL' ) ?: 'new';
+		$max = (int) ( getenv( 'ASB_MAX_FLIPS_LISTED' ) ?: 50 );
+
+		$md   = [];
+		$md[] = '### Spam/ham flips';
+		$md[] = '';
+		if ( ! $stats['flips'] ) {
+			$md[] = '_None — the two builds agree on every decision._';
+		} else {
+			$listed = $max > 0 ? array_slice( $stats['flips'], 0, $max ) : $stats['flips'];
+			$md[]   = sprintf( '| comment | %s | %s |', $this->mdEscape( $old ), $this->mdEscape( $new ) );
+			$md[]   = '|---|---|---|';
+			foreach ( $listed as $flip ) {
+				$md[] = sprintf(
+					'| `%s` | %s (%s) | %s (%s) |',
+					$this->mdEscape( (string) $flip['comment_id'] ),
+					$this->mdEscape( $flip['old']['status'] ),
+					$this->mdCode( $flip['old']['reason'] ),
+					$this->mdEscape( $flip['new']['status'] ),
+					$this->mdCode( $flip['new']['reason'] )
+				);
+			}
+			if ( count( $listed ) < count( $stats['flips'] ) ) {
+				$md[] = '';
+				$md[] = sprintf( '_… and %d more._', count( $stats['flips'] ) - count( $listed ) );
+			}
+		}
+
+		$md[] = '';
+		$md[] = '### Reason changes with the same decision';
+		$md[] = '';
+		if ( ! $stats['reason_transitions'] ) {
+			$md[] = '_None._';
+		} else {
+			$md[] = sprintf( '| count | %s | %s |', $this->mdEscape( $old ), $this->mdEscape( $new ) );
+			$md[] = '|---:|---|---|';
+			foreach ( $stats['reason_transitions'] as $key => $count ) {
+				list( $old_reason, $new_reason ) = explode( "\t", $key );
+				$md[]                            = sprintf(
+					'| %d | %s | %s |',
+					$count,
+					$this->mdCode( '(none)' === $old_reason ? null : $old_reason ),
+					$this->mdCode( '(none)' === $new_reason ? null : $new_reason )
+				);
+			}
+		}
+
+		return implode( "\n", $md ) . "\n";
+	}
+
+	/**
+	 * Neutralise Markdown table syntax in a value.
+	 *
+	 * @param string $value Raw value.
+	 */
+	private function mdEscape( string $value ): string {
+		return str_replace( [ '|', "\n" ], [ '\|', ' ' ], $value );
+	}
+
+	/**
+	 * Render a nullable reason as inline code, or a dash when absent.
+	 *
+	 * @param string|null $value Reason, or null.
+	 */
+	private function mdCode( ?string $value ): string {
+		if ( null === $value || '' === $value ) {
+			return '—';
+		}
+
+		return '`' . $this->mdEscape( $value ) . '`';
+	}
+
+	/**
 	 * Render a human-readable report.
 	 *
 	 * @param array $stats Result of {@see compareResults()}.
@@ -320,6 +404,12 @@ if ( PHP_SAPI === 'cli' && isset( $argv ) && realpath( $argv[0] ) === realpath( 
 	$comparer = new AntispamPluginStatComparer();
 	$stats    = $comparer->compareResults();
 	echo $comparer->generateReport( $stats );
+
+	// Markdown detail tables, for a job summary or a pull-request comment.
+	$md_file = getenv( 'ASB_REPORT_MD' ) ?: '';
+	if ( '' !== $md_file ) {
+		file_put_contents( $md_file, $comparer->generateMarkdown( $stats ) );
+	}
 
 	// Machine-readable counts for callers that would otherwise have to scrape the
 	// prose above with a regex.
