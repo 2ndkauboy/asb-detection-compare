@@ -76,8 +76,11 @@ SNAP_OUT="${RUNNER_TEMP:-$(dirname "$WORK")}/asb-snapshot-out"
 # directory so both can be uploaded as separate artifacts under the canonical
 # asset name.
 BASE_OUT="${RUNNER_TEMP:-$(dirname "$WORK")}/asb-baseline-snapshot-out"
-rm -rf "$WORK" "$SNAP_OUT" "$BASE_OUT"
-mkdir -p "$WORK" "$SNAP_OUT" "$BASE_OUT"
+# The rendered report has to outlive this step so a later one can post it, and it
+# must not sit in a snapshot directory (those are checked for strays).
+REPORT_DIR="${RUNNER_TEMP:-$(dirname "$WORK")}/asb-report"
+rm -rf "$WORK" "$SNAP_OUT" "$BASE_OUT" "$REPORT_DIR"
+mkdir -p "$WORK" "$SNAP_OUT" "$BASE_OUT" "$REPORT_DIR"
 WP_DIR="$WORK/wp"
 BASE_DIR="$WORK/baseline"
 trap 'git -C "$ASB_PLUGIN_DIR" worktree remove --force "$BASE_DIR" 2>/dev/null || true; rm -rf "$WORK"' EXIT
@@ -412,6 +415,7 @@ report="$(
 	ASB_OLD_FILE="$BASE_SNAPSHOT" ASB_NEW_FILE="$HEAD_SNAPSHOT" \
 	ASB_OLD_LABEL="$ASB_BASELINE_REF" ASB_NEW_LABEL="HEAD" \
 	ASB_MAX_FLIPS_LISTED="$ASB_MAX_FLIPS_LISTED" ASB_STATS_FILE="$stats_file" \
+	ASB_REPORT_MD="$WORK/comparison.md" \
 	php "$ASB_ACTION_DIR/lib/antispam-plugin-stat-comparer.php"
 )"
 echo "$report"
@@ -472,10 +476,49 @@ if [ "$baseline_classified" = "true" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 10. GitHub outputs + job summary.
+# 10. Render the report, then GitHub outputs + job summary.
 # ---------------------------------------------------------------------------
+if [ "$baseline_source" = "release-asset" ]; then
+	baseline_note="reused the snapshot published on that release (no re-classification)"
+else
+	baseline_note="classified in this run"
+fi
+
+# One rendering, used for both the job summary and any pull-request comment. The
+# marker lets a comment be updated in place instead of posted again per run.
+REPORT_MD="$REPORT_DIR/report.md"
+{
+	echo "<!-- asb-detection-compare -->"
+	echo "## Antispam Bee spam-detection comparison"
+	echo
+	echo "| | |"
+	echo "|---|---|"
+	echo "| **HEAD** | \`$ASB_BRANCH\` (\`${head_sha:0:12}\`) |"
+	echo "| **Baseline** | \`$ASB_BASELINE_REF\` (\`${baseline_sha:0:12}\`) — $baseline_note |"
+	echo "| **Corpus** | $corpus_count rows (\`$CORPUS_LABEL/$corpus_token\`) |"
+	echo "| **Compared** | $compared |"
+	echo "| **Spam/ham flips** | **$flips** |"
+	echo "| **Reason-only differences** | $reason_diffs |"
+	if [ "$only_in_baseline" != "0" ] || [ "$only_in_head" != "0" ]; then
+		echo "| **Only one side** | $only_in_baseline / $only_in_head |"
+	fi
+	echo
+	if [ -n "$drift_notes" ]; then
+		echo "> [!WARNING]"
+		while IFS= read -r line; do
+			echo "> $line"
+		done <<< "$drift_notes"
+		echo
+	fi
+	cat "$WORK/comparison.md"
+	echo
+	echo "<sub>Flips are the signal: the two builds disagree on spam vs. ham."
+	echo "Reason-only differences mean the same decision reached via different rules.</sub>"
+} > "$REPORT_MD"
+
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
 	{
+		echo "report-markdown=$REPORT_MD"
 		echo "baseline=$ASB_BASELINE_REF"
 		echo "baseline-sha=$baseline_sha"
 		echo "baseline-source=$baseline_source"
@@ -489,34 +532,21 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
 	} >> "$GITHUB_OUTPUT"
 fi
 
-if [ "$baseline_source" = "release-asset" ]; then
-	baseline_note="reused the snapshot published on that release (no re-classification)"
-else
-	baseline_note="classified in this run"
-fi
-
-summary "## Antispam Bee spam-detection comparison"
-summary ""
-summary "- **HEAD (prepared):** \`$ASB_BRANCH\`"
-summary "- **Baseline:** \`$ASB_BASELINE_REF\` (\`${baseline_sha:0:12}\`) — $baseline_note"
-summary "- **Corpus rows:** $corpus_count (\`$CORPUS_LABEL/$corpus_token\`)"
-summary "- **Compared:** $compared"
-summary "- **Spam/ham flips:** **$flips**"
-summary "- **Reason-only differences:** $reason_diffs"
-if [ -n "$baseline_snapshot_out" ]; then
-	summary "- **Baseline snapshot produced:** attach it to the \`$ASB_BASELINE_REF\` release to make later runs single-pass"
-fi
-if [ -n "$drift_notes" ]; then
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+	cat "$REPORT_MD" >> "$GITHUB_STEP_SUMMARY"
+	if [ -n "$baseline_snapshot_out" ]; then
+		summary ""
+		summary "**Baseline snapshot produced** — attach it to the \`$ASB_BASELINE_REF\` release to make later runs single-pass."
+	fi
 	summary ""
-	summary "> [!WARNING]"
-	while IFS= read -r line; do
-		summary "> $line"
-	done <<< "$drift_notes"
+	summary "<details><summary>Full text report</summary>"
+	summary ""
+	summary '```'
+	summary "$report"
+	summary '```'
+	summary ""
+	summary "</details>"
 fi
-summary ""
-summary '```'
-summary "$report"
-summary '```'
 
 log "Result: $flips spam/ham flip(s)"
 if [ "$flips" -gt 0 ] && [ "$FAIL_ON_FLIPS" = "true" ]; then
