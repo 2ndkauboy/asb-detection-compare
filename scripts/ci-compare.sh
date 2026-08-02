@@ -32,6 +32,12 @@
 #   ASB_WP_VERSION             WordPress core version to install (default latest).
 #   ASB_MAX_FLIPS_LISTED       Cap on flips listed in the report (default 50).
 #   ASB_SHARD_MODE             Shard grouping: "email" (default) or "identity".
+#   ASB_OPTIONS_FILE           Option fixture to apply (default config/…3x.json).
+#   ASB_LANG_API               "true" -> run a local franc service and compare
+#                              LangSpam against it instead of the public API.
+#   ASB_LANG_API_WORKERS       Processes for that service (default: WORKERS).
+#   ASB_BUFFER_POOL            InnoDB buffer pool to request, e.g. "1G" ("" to
+#                              leave the server alone).
 set -euo pipefail
 
 ASB_ACTION_DIR="${ASB_ACTION_DIR:?ASB_ACTION_DIR is required}"
@@ -52,6 +58,14 @@ ASB_SNAPSHOT_REPO="${ASB_SNAPSHOT_REPO:-${GITHUB_REPOSITORY:-}}"
 ASB_WP_VERSION="${ASB_WP_VERSION:-latest}"
 ASB_MAX_FLIPS_LISTED="${ASB_MAX_FLIPS_LISTED:-50}"
 export ASB_SNAPSHOT_SALT="${ASB_SNAPSHOT_SALT:-}"
+ASB_LANG_API="${ASB_LANG_API:-false}"
+ASB_LANG_API_WORKERS="${ASB_LANG_API_WORKERS:-$WORKERS}"
+ASB_BUFFER_POOL="${ASB_BUFFER_POOL:-1G}"
+if [ "$ASB_LANG_API" = "true" ]; then
+	OPTIONS_FILE="${ASB_OPTIONS_FILE:-$ASB_ACTION_DIR/config/antispam_bee_options.3x.lang.json}"
+else
+	OPTIONS_FILE="${ASB_OPTIONS_FILE:-$ASB_ACTION_DIR/config/antispam_bee_options.3x.json}"
+fi
 
 # Cosmetic only: which corpus this run used, for the asset filename. Decided
 # before CORPUS_FILE is rewritten to point at the normalised dump.
@@ -83,7 +97,16 @@ rm -rf "$WORK" "$SNAP_OUT" "$BASE_OUT" "$REPORT_DIR"
 mkdir -p "$WORK" "$SNAP_OUT" "$BASE_OUT" "$REPORT_DIR"
 WP_DIR="$WORK/wp"
 BASE_DIR="$WORK/baseline"
-trap 'git -C "$ASB_PLUGIN_DIR" worktree remove --force "$BASE_DIR" 2>/dev/null || true; rm -rf "$WORK"' EXIT
+cleanup() {
+	# The language service is a process group (cluster primary + workers), so
+	# signal the group rather than just the primary.
+	if [ -f "$WORK/lang-api.pid" ]; then
+		kill -- "-$(cat "$WORK/lang-api.pid")" 2>/dev/null || kill "$(cat "$WORK/lang-api.pid")" 2>/dev/null || true
+	fi
+	git -C "$ASB_PLUGIN_DIR" worktree remove --force "$BASE_DIR" 2>/dev/null || true
+	rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 # WP-CLI wrapper (path-scoped, non-interactive, allow running as root in CI).
 wp() { command wp --path="$WP_DIR" --allow-root "$@"; }
@@ -142,6 +165,32 @@ for _ in $(seq 1 60); do
 	sleep 2
 done
 
+# A default MariaDB/MySQL container ships a 128 MB InnoDB buffer pool. The corpus
+# is ~313 MB and the site tables grow past 255 MB during a pass, so the working
+# set outgrows the pool part-way through and every insert starts hitting disk —
+# measured locally as a collapse from ~10,700 to ~380 comments/min, and the most
+# likely cause of the throughput decay seen in CI. Resizing is online and
+# best-effort: a server that refuses (no privilege, or already larger) is fine.
+if [ -n "$ASB_BUFFER_POOL" ]; then
+	pool_bytes="$(numfmt --from=iec "$ASB_BUFFER_POOL" 2>/dev/null || echo 0)"
+	if [ "$pool_bytes" -gt 0 ]; then
+		current="$(php -r '
+			$c = @mysqli_connect($argv[1], $argv[2], $argv[3], "", (int) $argv[4]);
+			if (!$c) { exit(1); }
+			$r = mysqli_query($c, "SELECT @@innodb_buffer_pool_size");
+			echo $r ? mysqli_fetch_row($r)[0] : 0;
+		' "$DB_HOST" "$DB_ROOT_USER" "$DB_ROOT_PASS" "$DB_PORT" 2>/dev/null || echo 0)"
+		if [ "${current:-0}" -lt "$pool_bytes" ]; then
+			log "Raising the InnoDB buffer pool to $ASB_BUFFER_POOL (was $(( ${current:-0} / 1024 / 1024 )) MB)"
+			php -r '
+				$c = @mysqli_connect($argv[1], $argv[2], $argv[3], "", (int) $argv[4]);
+				if (!$c) { exit(0); }
+				@mysqli_query($c, "SET GLOBAL innodb_buffer_pool_size = " . (int) $argv[5]);
+			' "$DB_HOST" "$DB_ROOT_USER" "$DB_ROOT_PASS" "$DB_PORT" "$pool_bytes" 2>/dev/null || true
+		fi
+	fi
+fi
+
 # ---------------------------------------------------------------------------
 # 3. Install WordPress once (site DB), then create + load the corpus DB.
 # ---------------------------------------------------------------------------
@@ -163,6 +212,42 @@ echo "WordPress: $wp_version"
 log "Installing support mu-plugins"
 mkdir -p "$WP_DIR/wp-content/mu-plugins"
 cp "$ASB_ACTION_DIR"/mu-plugins/*.php "$WP_DIR/wp-content/mu-plugins/"
+
+# ---------------------------------------------------------------------------
+# Optional: a local language-detection service, so LangSpam can be compared
+# without calling (or depending on) the public API.
+# ---------------------------------------------------------------------------
+if [ "$ASB_LANG_API" = "true" ]; then
+	if ! command -v node >/dev/null; then
+		echo "ASB_LANG_API=true needs node on PATH." >&2
+		exit 1
+	fi
+	log "Starting the local language service ($ASB_LANG_API_WORKERS workers)"
+	LANG_DIR="$WORK/lang-api"
+	mkdir -p "$LANG_DIR"
+	cp "$ASB_ACTION_DIR/scripts/lang-api/package.json" "$ASB_ACTION_DIR/scripts/lang-api/server.mjs" "$LANG_DIR/"
+	( cd "$LANG_DIR" && npm install --omit=dev --no-audit --no-fund --loglevel=error )
+	( cd "$LANG_DIR" && ASB_LANG_API_WORKERS="$ASB_LANG_API_WORKERS" node server.mjs & echo $! > "$WORK/lang-api.pid" )
+
+	# The classifier must not start before the service answers, or every early
+	# comment silently skips detection and the comparison is quietly wrong.
+	ready=false
+	for _ in $(seq 1 30); do
+		if curl -sf -m 2 -X POST -H 'Content-Type: application/json' \
+			-d '{"body":"Dies ist ein deutscher Satz mit genug Text zur Erkennung."}' \
+			http://127.0.0.1:8080/ >/dev/null 2>&1; then
+			ready=true
+			break
+		fi
+		sleep 1
+	done
+	if [ "$ready" != "true" ]; then
+		echo "The local language service did not become ready on :8080." >&2
+		exit 1
+	fi
+	cp "$ASB_ACTION_DIR/scripts/lang-api/mu-plugin.php" "$WP_DIR/wp-content/mu-plugins/asb-lang-api.php"
+	echo "Language service ready; LangSpam will use it."
+fi
 
 # Resolve the raw corpus source — a download from CORPUS_URL, or CORPUS_FILE
 # (the bundled fixture by default, or a file the workflow prepared, e.g. a
@@ -240,13 +325,26 @@ fi
 # Everything that can change a verdict, hashed into one token. The comparer is
 # deliberately NOT in here: it reads snapshots, it does not produce them, so a
 # change to it must not invalidate every published asset.
-harness_fp="$(cat \
-	"$ASB_ACTION_DIR/lib/driver.php" \
-	"$ASB_ACTION_DIR/lib/build-shards.php" \
-	"$ASB_ACTION_DIR/lib/snapshot-format.php" \
-	"$ASB_ACTION_DIR/scripts/export-snapshot.php" \
-	"$ASB_ACTION_DIR/config/antispam_bee_options.3x.json" \
-	"$ASB_ACTION_DIR"/mu-plugins/*.php | sha256sum | cut -d' ' -f1)"
+harness_files=(
+	"$ASB_ACTION_DIR/lib/driver.php"
+	"$ASB_ACTION_DIR/lib/build-shards.php"
+	"$ASB_ACTION_DIR/lib/snapshot-format.php"
+	"$ASB_ACTION_DIR/scripts/export-snapshot.php"
+	"$OPTIONS_FILE"
+	"$ASB_ACTION_DIR"/mu-plugins/*.php
+)
+# The language service only affects verdicts when it is actually used, and the
+# franc version is part of the experiment — so bind it in then, and only then.
+# Listing it unconditionally would change every fingerprint and invalidate the
+# already-published snapshots for runs that never call it.
+if [ "$ASB_LANG_API" = "true" ]; then
+	harness_files+=(
+		"$ASB_ACTION_DIR/scripts/lang-api/server.mjs"
+		"$ASB_ACTION_DIR/scripts/lang-api/package.json"
+		"$ASB_ACTION_DIR/scripts/lang-api/mu-plugin.php"
+	)
+fi
+harness_fp="$(cat "${harness_files[@]}" | sha256sum | cut -d' ' -f1)"
 
 # The fingerprint is per commit: it answers "was this classification produced
 # from *this* plugin build under *these* conditions". The baseline's fingerprint
@@ -339,7 +437,7 @@ classify() {
 	wp plugin activate antispam-bee
 
 	if [ -d "$src/src" ]; then
-		wp option update antispam_bee_options --format=json < "$ASB_ACTION_DIR/config/antispam_bee_options.3x.json" >/dev/null
+		wp option update antispam_bee_options --format=json < "$OPTIONS_FILE" >/dev/null
 	else
 		echo "  ! '$label' is not a 3.x build (no src/); no option fixture applied." >&2
 	fi

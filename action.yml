@@ -75,6 +75,29 @@ inputs:
   max-flips-listed:
     description: 'Cap on how many individual flips are listed in the report.'
     default: '50'
+  lang-api:
+    description: >-
+      Run a local franc-based language service and compare the LangSpam rule
+      against it. Without this the rule stays off, because it would otherwise
+      call a public API once per eligible comment.
+    default: 'false'
+  lang-api-workers:
+    description: >-
+      Processes for that service. The classifier calls it synchronously, so this
+      should match `workers`; defaults to it.
+    default: ''
+  options-file:
+    description: >-
+      Option fixture to apply to both builds. Defaults to the bundled 3.x set, or
+      its LangSpam variant when `lang-api` is on.
+    default: ''
+  buffer-pool:
+    description: >-
+      InnoDB buffer pool to request from the database before classifying. The
+      container default of 128 MB is far smaller than the working set and causes
+      a severe slowdown part-way through a full-corpus run. Empty to leave the
+      server untouched.
+    default: '1G'
   github-token:
     description: 'Token used to look up the baseline snapshot on the release.'
     default: ${{ github.token }}
@@ -158,5 +181,9 @@ runs:
         ASB_CORPUS_ID: ${{ inputs.corpus-id }}
         ASB_CORPUS_LABEL: ${{ inputs.corpus-label }}
         ASB_MAX_FLIPS_LISTED: ${{ inputs.max-flips-listed }}
+        ASB_LANG_API: ${{ inputs.lang-api }}
+        ASB_LANG_API_WORKERS: ${{ inputs.lang-api-workers || inputs.workers }}
+        ASB_OPTIONS_FILE: ${{ inputs.options-file }}
+        ASB_BUFFER_POOL: ${{ inputs.buffer-pool }}
         GH_TOKEN: ${{ inputs.github-token }}
       run: bash "$ASB_ACTION_DIR/scripts/ci-compare.sh"

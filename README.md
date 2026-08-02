@@ -360,6 +360,37 @@ a warning whenever a map comes out skewed.
 
 Set `use-baseline-snapshot: 'false'` to force a full two-pass run.
 
+### Comparing the language rule
+
+`LangSpam` is off in the default option fixture, because it calls a public API
+once per eligible comment — on a 333k-comment corpus that is ~205,000 requests
+per build. Set `lang-api: 'true'` and the runner starts a local
+[franc](https://github.com/wooorm/franc) service instead, points the rule at it,
+and switches to the `…3x.lang.json` fixture (which enables the rule, allowing
+German). This is the same mechanism the plugin's own E2E tests use.
+
+The service runs as a cluster of processes sharing port 8080 — the classifier
+calls it synchronously, so it needs one process per worker (`lang-api-workers`,
+defaulting to `workers`). Port 8080 is not configurable: `wp_safe_remote_post()`
+goes through `wp_http_validate_url()`, which permits only 80, 443 and 8080.
+
+The franc version is pinned in `scripts/lang-api/package.json` and folded into
+the fingerprint **only when the service is used**, so a language comparison is
+tied to the detector that produced it without disturbing the fingerprint — or the
+published snapshots — of ordinary runs.
+
+### Database memory
+
+A stock MariaDB/MySQL container ships a **128 MB** InnoDB buffer pool. The corpus
+is ~313 MB and the site tables grow past 255 MB during a pass, so the working set
+outgrows the pool part-way through and inserts start hitting disk. Measured
+locally, throughput collapsed from ~10,700 to ~380 comments/min mid-run; with a
+4 GB pool the same run held ~9,100/min flat to the last comment.
+
+The runner therefore raises the pool to `buffer-pool` (default `1G`) before
+classifying. The resize is online and best-effort — a server that refuses, or is
+already larger, is left alone.
+
 ### Providing the release corpus (encrypted)
 
 The full corpus is real comments (likely PII), so it must not be public — but a
