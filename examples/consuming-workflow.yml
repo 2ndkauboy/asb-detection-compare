@@ -29,10 +29,11 @@ on:
         description: 'Baseline tag or branch to compare the current branch against.'
         required: true
         default: 'v3'
-      full_corpus:
-        description: 'Use the full encrypted corpus (otherwise the small bundled fixture).'
-        type: boolean
-        default: true
+      corpus:
+        description: 'Which corpus to classify.'
+        type: choice
+        options: [ full, small, fixture ]
+        default: small
       fail_on_flips:
         description: 'Fail the run if any spam/ham verdict flips.'
         type: boolean
@@ -63,10 +64,23 @@ jobs:
       contents: read        # look up the baseline snapshot on the release
       pull-requests: write  # post the full-corpus result on a PR (manual runs)
     env:
-      # Use the full corpus for prepare-* pushes and for manual runs that ask for
-      # it — but only when the corpus is actually configured (else fall back to
-      # the bundled fixture). PRs never use it.
-      ASB_USE_FULL: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.full_corpus)) && vars.ASB_CORPUS_ENC_URL != '' }}
+      # Which corpus this run uses.
+      #
+      #   full     ~333k comments, authoritative, ~32 min per pass
+      #   small    ~10k stratified, ~25 s per pass — every comment where a
+      #            content rule can still run, plus a little honeypot-caught spam
+      #   fixture  the action's bundled 122-row sample; no secrets needed
+      #
+      # Forks never get secrets, so they always fall back to the fixture. Pushes
+      # to prepare-* use the full corpus; pull requests from this repo use the
+      # small one; manual runs choose. Falls back to the fixture whenever the
+      # corresponding URL is not configured.
+      ASB_CORPUS: >-
+        ${{ github.event.pull_request.head.repo.fork && 'fixture'
+         || (github.event_name == 'workflow_dispatch' && inputs.corpus)
+         || (github.event_name == 'push' && 'full')
+         || (github.event_name == 'pull_request' && 'small')
+         || 'fixture' }}
     services:
       mysql:
         image: mariadb:10.6
@@ -85,18 +99,30 @@ jobs:
         with:
           fetch-depth: 0        # full history/tags for baseline resolution
 
-      # Download the encrypted full corpus (public ciphertext, useless without
-      # the key) and decrypt it with the passphrase secret. Runs only when the
-      # full corpus is selected and configured.
-      - name: Fetch & decrypt the release corpus
-        if: env.ASB_USE_FULL == 'true'
+      # Download the encrypted corpus (public ciphertext, useless without the key)
+      # and decrypt it. Both corpora carry real comment content, including real
+      # ham, which is exactly why they are encrypted and never committed.
+      #
+      # Sets ASB_CORPUS_READY so a missing URL degrades to the bundled fixture
+      # instead of failing the run.
+      - name: Fetch & decrypt the corpus
+        if: env.ASB_CORPUS != 'fixture'
         env:
-          ASB_CORPUS_ENC_URL: ${{ vars.ASB_CORPUS_ENC_URL }}
           ASB_CORPUS_KEY: ${{ secrets.ASB_CORPUS_KEY }}
+          ENC_URL: >-
+            ${{ env.ASB_CORPUS == 'full' && vars.ASB_CORPUS_ENC_URL
+             || vars.ASB_CORPUS_SMALL_ENC_URL }}
         run: |
-          curl -fSL --retry 3 -o corpus.sql.gz.gpg "$ASB_CORPUS_ENC_URL"
+          set -euo pipefail
+          if [ -z "${ENC_URL:-}" ] || [ -z "${ASB_CORPUS_KEY:-}" ]; then
+            echo "::notice::No '${{ env.ASB_CORPUS }}' corpus configured; using the bundled fixture."
+            echo "ASB_CORPUS_READY=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          curl -fSL --retry 3 -o corpus.sql.gz.gpg "$ENC_URL"
           gpg --batch --quiet --yes --passphrase "$ASB_CORPUS_KEY" \
             -o corpus.sql.gz -d corpus.sql.gz.gpg
+          echo "ASB_CORPUS_READY=true" >> "$GITHUB_ENV"
 
       - name: Compare spam detection
         id: compare
@@ -107,8 +133,12 @@ jobs:
           # PR -> the PR's base branch. Manual -> the chosen baseline. Prepare
           # push -> empty, so the baseline is resolved from the branch name.
           baseline-ref: ${{ (github.event_name == 'pull_request' && github.base_ref) || (github.event_name == 'workflow_dispatch' && inputs.baseline_ref) || '' }}
-          # Full corpus when selected+configured, else the action's bundled fixture.
-          corpus-file: ${{ env.ASB_USE_FULL == 'true' && format('{0}/corpus.sql.gz', github.workspace) || '' }}
+          # The decrypted corpus when one was fetched, else the bundled fixture.
+          corpus-file: ${{ env.ASB_CORPUS_READY == 'true' && format('{0}/corpus.sql.gz', github.workspace) || '' }}
+          # Names the snapshot asset, e.g. asb-snapshot-small-4eb1dc68.tsv.gz.
+          # Each corpus has its own fingerprint, so their snapshots never collide
+          # and a run only ever finds the baseline matching its own corpus.
+          corpus-label: ${{ env.ASB_CORPUS_READY == 'true' && env.ASB_CORPUS || 'fixture' }}
           # Manual runs can opt out of failing on flips; everything else gates.
           fail-on-flips: ${{ (github.event_name == 'workflow_dispatch' && inputs.fail_on_flips == false) && 'false' || 'true' }}
           # Pinning WordPress keeps published snapshots valid across core
@@ -125,14 +155,18 @@ jobs:
 
       # Keep this run's verdict snapshot. When this version is released,
       # attach-snapshot-on-release.yml attaches it to the release, and the next
-      # prepare run reuses it as its baseline instead of classifying twice.
-      # Only full-corpus runs are worth keeping — a fixture snapshot is cheap to
-      # recompute and would just shadow the real one.
+      # comparison against that release reuses it instead of classifying twice.
+      # Fixture snapshots are not worth keeping — cheap to recompute, and they
+      # would shadow a real one.
+      #
+      # The corpus label is part of the artifact name: with two corpora in play,
+      # a single fixed name would let the release workflow attach the wrong
+      # corpus's snapshot to a release.
       - name: Upload the verdict snapshot
-        if: env.ASB_USE_FULL == 'true' && steps.compare.outputs.snapshot-file != ''
+        if: env.ASB_CORPUS_READY == 'true' && steps.compare.outputs.snapshot-file != ''
         uses: actions/upload-artifact@v4
         with:
-          name: asb-detection-snapshot
+          name: asb-detection-snapshot-${{ env.ASB_CORPUS }}
           path: ${{ steps.compare.outputs.snapshot-file }}
           retention-days: 90
           if-no-files-found: error
@@ -141,22 +175,22 @@ jobs:
       # publishable — they describe a released tag. Attach this one to that
       # release and the next comparison against it becomes single-pass.
       - name: Upload the baseline verdict snapshot
-        if: env.ASB_USE_FULL == 'true' && steps.compare.outputs.baseline-snapshot-file != ''
+        if: env.ASB_CORPUS_READY == 'true' && steps.compare.outputs.baseline-snapshot-file != ''
         uses: actions/upload-artifact@v4
         with:
-          name: asb-detection-baseline-snapshot
+          name: asb-detection-baseline-snapshot-${{ env.ASB_CORPUS }}
           path: ${{ steps.compare.outputs.baseline-snapshot-file }}
           retention-days: 90
           if-no-files-found: error
 
-      # Post the result on a PR — only for full-corpus runs, since a PR-event run
-      # sees just the small bundled fixture and would report almost nothing.
-      # Updates its own comment in place instead of adding one per run.
+      # Post the result on a PR. Skipped for fixture runs, which compare 112
+      # synthetic comments and would report almost nothing. Updates its own
+      # comment in place instead of adding one per run.
       #
       # `always()` so a failing check (flips found) still reports: that is exactly
       # the case someone needs the table for.
       - name: Comment the result on the PR
-        if: always() && env.ASB_USE_FULL == 'true' && inputs.comment_pr != '' && steps.compare.outputs.report-markdown != ''
+        if: always() && env.ASB_CORPUS_READY == 'true' && inputs.comment_pr != '' && steps.compare.outputs.report-markdown != ''
         env:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ inputs.comment_pr }}

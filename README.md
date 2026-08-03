@@ -166,6 +166,8 @@ service + `wp-cli`, no DDEV/wp-env) and a small **bundled corpus**
   the corpus → shard it → classify HEAD → reuse or classify the baseline → diff
   → job summary. See [Baseline snapshots](#baseline-snapshots).
 - `scripts/resolve-baseline.php` — maps a branch name to the baseline tag.
+- `scripts/build-corpus.php` — builds the small stratified corpus from a full one
+  (see [Corpora](#corpora)). Keeps real content, so its output stays encrypted.
 - `scripts/build-fixture.php` — regenerates `fixtures/corpus.sql` from a real
   corpus, stratified by `antispam_bee_reason` + `comment_type` (≤10 rows each)
   with PII removed (synthetic author/e-mail/IP everywhere, synthetic ham
@@ -244,6 +246,65 @@ example takes the target PR number as a `workflow_dispatch` input. The report
 carries an `<!-- asb-detection-compare -->` marker so the step updates its own
 previous comment instead of adding one per run, and it skips fork PRs, which
 cannot be commented on with the default read-only token.
+
+### Corpora
+
+Three, and the middle one exists because of a short-circuit:
+
+| corpus | comments | per pass | where |
+|--------|----------|----------|-------|
+| full | 332,834 | ~32 min | `prepare-*` pushes; authoritative |
+| **small** | **9,750** | **~25 s** | pull requests from this repo |
+| fixture (`fixtures/corpus.sql`) | 122 | seconds | fork pull requests |
+
+The small corpus measures at 23 s of classification per pass, 45 s for a complete
+two-version comparison including setup. The full-corpus figure is derived rather
+than measured: the notification stalls described in
+`docs/honeypot-bypass-experiment.md` cost a fixed ~1,323 s of worker time on the
+6,755 ham comments, which the small corpus keeps whole, so eliminating them saves
+the same absolute ~4 min at 6 workers in both.
+
+The full corpus is **97.6 % honeypot-caught spam** (`css` in 2.x,
+`asb-invalid-request` in 3.x). Since 3.x wired up `is_final()`, those comments
+return from `Rules::apply()` before `BBCode`, `RegexpSpam`, `LangSpam` or
+`DbSpam` are ever evaluated — final rules run first and stop on a match. So the
+content rules only ever see about **2 %** of it, while the rest costs half an hour
+a pass.
+
+`scripts/build-corpus.php` therefore keeps every comment where a non-final rule
+can still run, and caps the honeypot-caught strata:
+
+| group | full | small |
+|-------|------|-------|
+| ham (nothing flagged it) | 6,755 | **6,755 — all of it** |
+| `css` | 324,948 | 1,864 |
+| `empty` | 634 | 634 |
+| `localdb` | 215 | 215 |
+| `manually` | 210 | 210 |
+| `title_is_name` | 62 | 62 |
+| `regexp` | 10 | 10 |
+
+Keeping the ham whole is the point: it is the false-positive check, and it is what
+tells you a rule change has started flagging real comments. (On the full corpus,
+3.x flags **1,946** comments that 2.x let through — that signal is preserved
+exactly.)
+
+Selection is stratified over (2.x reason × 3.x reason × comment type × script) and
+**deterministic** — an even stride by `comment_ID` within each stratum. Corpus
+identity feeds the fingerprint below, so a regenerated corpus that differed by one
+row would invalidate every published snapshot.
+
+Both real corpora carry real comment content, including real ham. **Keep them
+encrypted and never commit them** — see
+[Providing the release corpus](#providing-the-release-corpus-encrypted). Only the
+122-row fixture is public, and its ham text is synthetic, which is exactly why it
+cannot serve as a false-positive check. Fork pull requests get the fixture because
+they cannot read secrets.
+
+Each corpus has its own fingerprint, so snapshots never collide: a release can
+carry `asb-snapshot-full-7f720ef3.tsv.gz` and
+`asb-snapshot-small-4eb1dc68.tsv.gz` side by side, and a run only ever finds the
+baseline matching the corpus it is classifying.
 
 ### Baseline snapshots
 
