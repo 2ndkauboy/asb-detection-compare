@@ -22,6 +22,13 @@
  * ASB_NEW_FILE, see `lib/snapshot-format.php`), which is how CI compares a
  * freshly classified HEAD against a baseline published as a release asset.
  *
+ * Point ASB_CORPUS_DB_NAME (plus ASB_CORPUS_DB_HOST/_PORT/_USER/_PASS,
+ * ASB_CORPUS_PREFIX and ASB_CORPUS_SALT_FILE) at the corpus to label each flip
+ * with how that comment was classified historically. Without it the comparison
+ * is unchanged, it just cannot tell a win from a possible regression:
+ * `manually` => spam means the new build catches something a human had removed
+ * by hand, while `unflagged` => spam means nothing had flagged it before.
+ *
  * @package AntispamBee\Comparison
  */
 
@@ -44,6 +51,24 @@ class AntispamPluginStatComparer {
 	 */
 	private $manifests = [];
 
+	/**
+	 * Corpus connection descriptor, used to label flips with the historical
+	 * classification. Empty `name` means the feature is off.
+	 *
+	 * @var array<string, mixed>
+	 */
+	private $corpus = [];
+
+	/**
+	 * The label used for a comment nothing flagged at the time.
+	 *
+	 * Deliberately not "ham": the corpus records what the site's own Antispam Bee
+	 * did, not ground truth. `manually` means a human decided it was spam, which
+	 * is strong evidence — the absence of any reason only means nothing flagged
+	 * the comment, which is not the same as it being legitimate.
+	 */
+	private const ORIGIN_UNFLAGGED = 'unflagged';
+
 	public function __construct() {
 		$this->sites = [
 			'old' => [
@@ -64,6 +89,19 @@ class AntispamPluginStatComparer {
 				'pass'   => getenv( 'ASB_NEW_DB_PASS' ) ?: 'db',
 				'prefix' => getenv( 'ASB_NEW_PREFIX' ) ?: 'wp_',
 			],
+		];
+
+		// Optional: the corpus itself, so a flip can be labelled with how the
+		// comment was classified historically. Without it the comparison still
+		// works, it just cannot tell the two kinds of flip apart.
+		$this->corpus = [
+			'name'      => getenv( 'ASB_CORPUS_DB_NAME' ) ?: '',
+			'host'      => getenv( 'ASB_CORPUS_DB_HOST' ) ?: '127.0.0.1',
+			'port'      => (int) ( getenv( 'ASB_CORPUS_DB_PORT' ) ?: 3306 ),
+			'user'      => getenv( 'ASB_CORPUS_DB_USER' ) ?: 'root',
+			'pass'      => getenv( 'ASB_CORPUS_DB_PASS' ) ?: '',
+			'prefix'    => getenv( 'ASB_CORPUS_PREFIX' ) ?: 'wp_',
+			'salt_file' => getenv( 'ASB_CORPUS_SALT_FILE' ) ?: '',
 		];
 	}
 
@@ -192,6 +230,85 @@ class AntispamPluginStatComparer {
 	}
 
 	/**
+	 * Map every corpus comment to how it was classified historically.
+	 *
+	 * This is what makes a flip readable. `manually` => spam means a human had
+	 * removed that comment by hand and the new build now catches it automatically
+	 * — a win. `unflagged` => spam means nothing had flagged it, which needs a
+	 * look. Both render identically without this.
+	 *
+	 * Keyed to match the verdict keys: snapshots are keyed by pseudonym, so the
+	 * corpus ids are pseudonymised with the same salt. A database-to-database
+	 * comparison has no salt and uses the raw ids.
+	 *
+	 * Read from the corpus, never from a snapshot: adding a field to the snapshot
+	 * format would change its schema and invalidate every published asset, and it
+	 * is unnecessary — the corpus is present in the run that does the comparing.
+	 *
+	 * @return array<string, string> Verdict key => historical label.
+	 */
+	private function loadOrigins(): array {
+		if ( '' === $this->corpus['name'] ) {
+			return [];
+		}
+
+		$salt = '';
+		if ( '' !== $this->corpus['salt_file'] ) {
+			if ( ! is_readable( $this->corpus['salt_file'] ) ) {
+				fwrite( STDERR, sprintf( "Cannot read the salt file %s; flips will not be labelled.\n", $this->corpus['salt_file'] ) );
+
+				return [];
+			}
+			$salt = trim( (string) file_get_contents( $this->corpus['salt_file'] ) );
+		}
+
+		mysqli_report( MYSQLI_REPORT_OFF );
+		$db = @mysqli_connect(
+			$this->corpus['host'],
+			$this->corpus['user'],
+			$this->corpus['pass'],
+			$this->corpus['name'],
+			$this->corpus['port']
+		);
+		if ( ! $db ) {
+			fwrite( STDERR, sprintf( "Cannot connect to the corpus DB %s; flips will not be labelled.\n", $this->corpus['name'] ) );
+
+			return [];
+		}
+		mysqli_set_charset( $db, 'utf8mb4' );
+
+		$comments    = $this->corpus['prefix'] . 'comments';
+		$commentmeta = $this->corpus['prefix'] . 'commentmeta';
+
+		$sql = "SELECT c.comment_ID AS id, r.meta_value AS reason
+				FROM `{$comments}` AS c
+				LEFT JOIN `{$commentmeta}` AS r
+					ON c.comment_ID = r.comment_id AND r.meta_key = 'antispam_bee_reason'";
+
+		$result = mysqli_query( $db, $sql );
+		if ( ! $result ) {
+			fwrite( STDERR, 'Corpus query failed: ' . mysqli_error( $db ) . "\n" );
+			mysqli_close( $db );
+
+			return [];
+		}
+
+		$origins = [];
+		while ( $row = mysqli_fetch_assoc( $result ) ) {
+			$id     = (string) $row['id'];
+			$reason = $row['reason'] !== null && '' !== $row['reason']
+				? (string) $row['reason']
+				: self::ORIGIN_UNFLAGGED;
+
+			$origins[ asb_snapshot_pid( $salt, $id ) ] = $reason;
+		}
+		mysqli_free_result( $result );
+		mysqli_close( $db );
+
+		return $origins;
+	}
+
+	/**
 	 * Compare both sites and collect statistics + differences.
 	 *
 	 * @return array
@@ -209,6 +326,7 @@ class AntispamPluginStatComparer {
 		// reason-label vocabulary change, so we aggregate those into a transition
 		// table instead of listing every comment.
 		$flips              = [];
+		$flip_origins       = [];
 		$reason_transitions = [];
 		$reason_diffs       = 0;
 		foreach ( $common as $id => $old_verdict ) {
@@ -219,6 +337,7 @@ class AntispamPluginStatComparer {
 					'comment_id' => $id,
 					'old'        => $old_verdict,
 					'new'        => $new_verdict,
+					'origin'     => null,
 				];
 				continue;
 			}
@@ -231,7 +350,26 @@ class AntispamPluginStatComparer {
 			}
 		}
 
+		// Only now, and only if there is anything to label: on the full corpus the
+		// origin map is 300k+ rows and most runs flip nothing at all, so building
+		// it unconditionally would be a full corpus scan for no output.
+		$origins = $flips ? $this->loadOrigins() : [];
+		foreach ( $flips as &$flip ) {
+			$flip['origin'] = $origins[ $flip['comment_id'] ] ?? null;
+			if ( null === $flip['origin'] ) {
+				continue;
+			}
+
+			// Grouped by direction, because the same origin means opposite things
+			// depending on which way the decision moved.
+			$direction            = $this->isSpam( $flip['new']['status'] ) ? '=> spam' : '=> not spam';
+			$key                  = $flip['origin'] . "\t" . $direction;
+			$flip_origins[ $key ] = ( $flip_origins[ $key ] ?? 0 ) + 1;
+		}
+		unset( $flip );
+
 		arsort( $reason_transitions );
+		arsort( $flip_origins );
 
 	return [
 			'old_total'           => count( $old ),
@@ -243,6 +381,8 @@ class AntispamPluginStatComparer {
 			'reason_diffs'        => $reason_diffs,
 			'flips'               => $flips,
 			'reason_transitions'  => $reason_transitions,
+			'flip_origins'        => $flip_origins,
+			'origins_available'   => (bool) $origins,
 		];
 	}
 
@@ -267,13 +407,21 @@ class AntispamPluginStatComparer {
 		if ( ! $stats['flips'] ) {
 			$md[] = '_None — the two builds agree on every decision._';
 		} else {
-			$listed = $max > 0 ? array_slice( $stats['flips'], 0, $max ) : $stats['flips'];
-			$md[]   = sprintf( '| comment | %s | %s |', $this->mdEscape( $old ), $this->mdEscape( $new ) );
-			$md[]   = '|---|---|---|';
+			$listed  = $max > 0 ? array_slice( $stats['flips'], 0, $max ) : $stats['flips'];
+			$origins = ! empty( $stats['origins_available'] );
+
+			if ( $origins ) {
+				$md[] = sprintf( '| comment | historically | %s | %s |', $this->mdEscape( $old ), $this->mdEscape( $new ) );
+				$md[] = '|---|---|---|---|';
+			} else {
+				$md[] = sprintf( '| comment | %s | %s |', $this->mdEscape( $old ), $this->mdEscape( $new ) );
+				$md[] = '|---|---|---|';
+			}
 			foreach ( $listed as $flip ) {
 				$md[] = sprintf(
-					'| `%s` | %s (%s) | %s (%s) |',
+					$origins ? '| `%s` | %s | %s (%s) | %s (%s) |' : '| `%s` |%s %s (%s) | %s (%s) |',
 					$this->mdEscape( (string) $flip['comment_id'] ),
+					$origins ? $this->mdCode( $flip['origin'] ) : '',
 					$this->mdEscape( $flip['old']['status'] ),
 					$this->mdCode( $flip['old']['reason'] ),
 					$this->mdEscape( $flip['new']['status'] ),
@@ -283,6 +431,27 @@ class AntispamPluginStatComparer {
 			if ( count( $listed ) < count( $stats['flips'] ) ) {
 				$md[] = '';
 				$md[] = sprintf( '_… and %d more._', count( $stats['flips'] ) - count( $listed ) );
+			}
+
+			if ( $stats['flip_origins'] ) {
+				$md[] = '';
+				$md[] = '| count | historically | became |';
+				$md[] = '|---:|---|---|';
+				foreach ( $stats['flip_origins'] as $key => $count ) {
+					list( $origin, $direction ) = explode( "\t", $key );
+					$md[]                       = sprintf(
+						'| %d | %s | %s |',
+						$count,
+						$this->mdCode( $origin ),
+						$this->mdEscape( ltrim( $direction, '=> ' ) )
+					);
+				}
+				$md[] = '';
+				$md[] = '<sub>`manually` is a human decision, so `manually` → spam means the new build '
+					. 'catches something that previously needed manual moderation. `'
+					. self::ORIGIN_UNFLAGGED . '` only means nothing flagged the comment at the time — '
+					. 'it is not proof the comment was legitimate, so those want a look rather than being '
+					. 'assumed to be regressions.</sub>';
 			}
 		}
 
@@ -369,8 +538,9 @@ class AntispamPluginStatComparer {
 		$listed = $max > 0 ? array_slice( $stats['flips'], 0, $max ) : $stats['flips'];
 		foreach ( $listed as $flip ) {
 			$report[] = sprintf(
-				'  #%-16s  %s=%s (%s)   %s=%s (%s)',
+				'  #%-16s  %s%s=%s (%s)   %s=%s (%s)',
 				$flip['comment_id'],
+				null !== ( $flip['origin'] ?? null ) ? sprintf( '[was: %s]  ', $flip['origin'] ) : '',
 				$old,
 				$flip['old']['status'],
 				$flip['old']['reason'] ?? '-',
@@ -383,6 +553,18 @@ class AntispamPluginStatComparer {
 			$report[] = sprintf( '  … and %d more (raise ASB_MAX_FLIPS_LISTED to see them)', count( $stats['flips'] ) - count( $listed ) );
 		}
 		$report[] = '';
+
+		// How the flipped comments were classified historically. `manually` is a
+		// human decision; the absence of a reason only means nothing flagged the
+		// comment, not that it was legitimate.
+		if ( ! empty( $stats['flip_origins'] ) ) {
+			$report[] = '--- Flips by historical classification ---';
+			foreach ( $stats['flip_origins'] as $key => $count ) {
+				list( $origin, $direction ) = explode( "\t", $key );
+				$report[]                   = sprintf( '  %6d  %-14s %s', $count, $origin, $direction );
+			}
+			$report[] = '';
+		}
 
 		// The noise: same decision, different reason label. Aggregated so a reason
 		// vocabulary change does not drown out anything meaningful.
@@ -415,6 +597,19 @@ if ( PHP_SAPI === 'cli' && isset( $argv ) && realpath( $argv[0] ) === realpath( 
 	// prose above with a regex.
 	$stats_file = getenv( 'ASB_STATS_FILE' ) ?: '';
 	if ( '' !== $stats_file ) {
+		// Reshape the origin aggregate: its in-memory keys are tab-joined pairs,
+		// which would be unusable as JSON object keys.
+		$origins = [];
+		foreach ( $stats['flip_origins'] as $key => $count ) {
+			list( $origin, $direction ) = explode( "\t", $key );
+			$origins[]                  = [
+				'historically' => $origin,
+				'became'       => ltrim( $direction, '=> ' ),
+				'count'        => $count,
+			];
+		}
+		$stats['flip_origins'] = $origins;
+
 		unset( $stats['flips'], $stats['reason_transitions'] );
 		file_put_contents( $stats_file, json_encode( $stats, JSON_UNESCAPED_SLASHES ) . "\n" );
 	}

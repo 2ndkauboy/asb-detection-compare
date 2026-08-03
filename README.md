@@ -80,6 +80,36 @@ WORKERS=8 ./ddev/run-version.sh norm     # -> wp_norm_*
 versions disagree on the decision — the signal), and a **reason-transition
 table** (same decision, different rule — the noise).
 
+### Reading a flip
+
+A flip on its own does not say whether the change is good or bad, so each one is
+labelled with **how that comment was classified historically**:
+
+```
+--- Spam/ham flips (the two versions disagree on the decision) ---
+  #e6caccc06396f371  [was: manually]   v3=0 (-)   HEAD=spam (asb-lang-spam)
+
+--- Flips by historical classification ---
+       1  manually       => spam
+```
+
+- **`manually` → spam** — a human had removed that comment by hand and the new
+  build now catches it automatically. **A win.**
+- **`unflagged` → spam** — nothing had flagged the comment before. Worth a look.
+- **anything → not spam** — a rule stopped catching something it used to catch.
+  Usually a regression.
+
+The two labels are *not* equally strong evidence, which is why the unflagged one
+is not called "ham". `manually` is a human decision. The absence of a reason only
+means nothing flagged the comment at the time — the corpus records what that
+site's Antispam Bee did, not ground truth — so it is no proof the comment was
+legitimate.
+
+The label is read from the corpus at compare time, deliberately not stored in the
+snapshot: adding a field there would change the format and invalidate every
+published asset. Runs without a corpus to hand (a snapshot-only comparison) simply
+omit the column.
+
 ## Snapshot caching
 
 Classifying the full corpus takes ~20–30 min, so re-running the same baseline
