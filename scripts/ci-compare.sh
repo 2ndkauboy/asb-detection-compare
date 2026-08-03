@@ -209,6 +209,20 @@ wp core install --url="http://localhost" --title="ASB detection compare" \
 wp_version="$(wp core version)"
 echo "WordPress: $wp_version"
 
+# Turn off the two comment notification settings. `pre_wp_mail` (see the support
+# mu-plugin) already stops the sending, but not the *building* of the mail - and
+# `wp_notify_moderator()` / `wp_notify_postauthor()` call `gethostbyaddr()` on the
+# commenter's IP to put a hostname in the body. Spam IPs rarely have a PTR record
+# and often have no responding authority, so the resolver blocks for its whole
+# retry budget: up to 63 s for a single comment, at zero CPU.
+#
+# These settings are checked before that lookup, so switching them off skips it
+# entirely. Only notified (i.e. non-spam) comments were affected, which is why the
+# ham path looked pathologically slow - on the small corpus 195 of 9,750 comments
+# took >= 1 s and accounted for 1,323 s of 1,499 s of classification time.
+wp option update comments_notify 0 >/dev/null
+wp option update moderation_notify 0 >/dev/null
+
 log "Installing support mu-plugins"
 mkdir -p "$WP_DIR/wp-content/mu-plugins"
 cp "$ASB_ACTION_DIR"/mu-plugins/*.php "$WP_DIR/wp-content/mu-plugins/"
