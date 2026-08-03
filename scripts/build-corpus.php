@@ -254,6 +254,15 @@ echo "--\n";
 echo "-- Contains real comment content, including real ham. Keep it encrypted;\n";
 echo "-- do not commit it. Do not edit by hand.\n\n";
 
+// The tables are utf8mb4, but that is not enough on its own: if the loading
+// client's connection charset is only 3-byte utf8, a 4-byte character (emoji -
+// this corpus has 32 of them) raises "Incorrect string value" and, with the
+// mysql CLI's default error handling, aborts the rest of the import. That fails
+// loudly at the comment it chokes on but silently leaves every later table
+// short, so declare the connection charset in the dump. Matches the full
+// corpus dump.
+echo "SET NAMES utf8mb4;\n\n";
+
 echo "DROP TABLE IF EXISTS wp_comments;\n";
 echo "CREATE TABLE wp_comments (\n";
 echo "\tcomment_ID           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,\n";
