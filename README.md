@@ -500,10 +500,26 @@ decrypts it, then passes the plain dump to the action via `corpus-file`.
 2. **Host** `corpus.sql.gz.gpg` at a URL the runner can reach — e.g. a **public**
    GitHub release asset. Public is fine: it is encrypted.
 
+   **Pin that URL to a release tag**, not to `latest`:
+
+   ```
+   ✅ https://github.com/<owner>/<repo>/releases/download/2026-07-26/corpus.sql.gz.gpg
+   ❌ https://github.com/<owner>/<repo>/releases/latest/download/corpus.sql.gz.gpg
+   ```
+
+   `latest` repoints the moment any newer release is published — including one
+   that carries a *different* corpus. Publishing a small-corpus release with only
+   `small-corpus.sql.gz.gpg` in it is enough to make the `latest` URL for
+   `corpus.sql.gz.gpg` start returning 404, and every full-corpus run then fails
+   at the download step. Each corpus gets its own pinned URL, so releasing one
+   can never disturb the other.
+
 3. **Configure** the consuming repo (`antispam-bee`):
-   - repository **variable** `ASB_CORPUS_ENC_URL` = the ciphertext URL (not
-     sensitive);
-   - repository **secret** `ASB_CORPUS_KEY` = the passphrase.
+   - repository **variable** `ASB_CORPUS_ENC_URL` = the pinned ciphertext URL
+     (not sensitive);
+   - repository **variable** `ASB_CORPUS_SMALL_ENC_URL` = the same for the small
+     corpus, if you use one (see [Corpora](#corpora));
+   - repository **secret** `ASB_CORPUS_KEY` = the passphrase, shared by both.
 
 4. The workflow's release-tier step (see `examples/consuming-workflow.yml`)
    downloads and decrypts it:
