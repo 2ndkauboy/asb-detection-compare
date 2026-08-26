@@ -44,7 +44,7 @@ DB user), separate from the site's `wp_` tables, so there is no collision.
 | `benchmark.sh` | Classify the same slice through both backends and print a speed table (see below). |
 | `compare.sh` | Diff two snapshots (spam/ham flips + reason transitions). |
 | `lib/` | `driver.php` (classifier), `build-shards.php` (DbSpam-safe sharding), `antispam-plugin-stat-comparer.php` (report engine). |
-| `mu-plugins/` | Support mu-plugins the driver needs: writes the join key and disables comment-flood throttling, duplicate-comment rejection, and notification mail. |
+| `mu-plugins/` | Support mu-plugins the driver needs: writes the join key, keeps Antispam Bee's comment verification on under WP-CLI, and disables comment-flood throttling, duplicate-comment rejection, and notification mail. |
 | `config/antispam_bee_options.3x.json` | Bundled known-good Antispam Bee 3.x option set (RegExp / Honeypot / BBCode / ApprovedEmail / save-reason on; Country and Gravatar off) so both versions run with an identical rule set. |
 | `dumps/` | The corpus dump (gitignored). |
 | `versions/` | Clone output (gitignored). |
