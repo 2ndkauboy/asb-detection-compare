@@ -154,19 +154,26 @@ if ( $worker_index < 0 || $worker_index >= $worker_count ) {
 /*
  * ---------------------------------------------------------------------------
  * Detect which Antispam Bee version is active and wire up the version-specific
- * honeypot handling. The secret field name is derived live from the plugin so
- * we never depend on a stale hard-coded hash.
+ * honeypot handling. The secret field name - and, where the plugin emits one,
+ * the name of the field marking a form the honeypot was injected into - is
+ * derived live from the plugin so we never depend on a stale hard-coded hash.
  * ---------------------------------------------------------------------------
  */
 if ( class_exists( '\AntispamBee\Helpers\Honeypot' ) && class_exists( '\AntispamBee\Rules\Honeypot' ) ) {
 	$asb_version = '3.x';
 	$secret_name = \AntispamBee\Helpers\Honeypot::get_secret_name_for_post();
+	// Builds from before the marker was introduced have no such field; there the
+	// rule still infers the honeypot from the secret field alone.
+	$marker_name = method_exists( '\AntispamBee\Helpers\Honeypot', 'get_marker_name_for_post' )
+		? \AntispamBee\Helpers\Honeypot::get_marker_name_for_post()
+		: null;
 	$run_precheck = static function () {
 		\AntispamBee\Rules\Honeypot::precheck();
 	};
 } elseif ( class_exists( '\Antispam_Bee' ) ) {
 	$asb_version = '2.x';
 	$secret_name = \Antispam_Bee::get_secret_name_for_post( $target_post_id );
+	$marker_name = null;
 	$run_precheck = static function () {
 		\Antispam_Bee::precheck_incoming_request();
 	};
@@ -230,13 +237,14 @@ if ( ! $target_post ) {
 
 asb_driver_log(
 	sprintf(
-		'ASB %s | worker %d/%d | source %s.%scomments | honeypot field "%s" | target post #%d | DbSpam: %s',
+		'ASB %s | worker %d/%d | source %s.%scomments | honeypot field "%s" | marker field %s | target post #%d | DbSpam: %s',
 		$asb_version,
 		$worker_index,
 		$worker_count,
 		$src_db_name,
 		$src_prefix,
 		$secret_name,
+		null === $marker_name ? '(none)' : '"' . $marker_name . '"',
 		$target_post_id,
 		$disable_db_spam ? 'DISABLED' : 'enabled'
 	)
@@ -452,6 +460,16 @@ while ( true ) {
 				'url'             => wp_slash( $url ),
 				'comment_post_ID' => (string) $target_post_id,
 			];
+			if ( null !== $marker_name ) {
+				/*
+				 * Every form the honeypot was injected into carries this marker, and
+				 * the rule only judges a submission that has it: without it the
+				 * secret field is never swapped back into `comment` and the
+				 * submission is rejected as empty, and a form the plugin never
+				 * touched draws no verdict at all.
+				 */
+				$_POST[ $marker_name ] = '1';
+			}
 			if ( 'css' === $reason ) {
 				// Historically caught via the visible (decoy) field: leave content there.
 				$_POST['comment'] = wp_slash( $content );
