@@ -263,9 +263,13 @@ alternative: download the corpus from a URL, `.sql` or `.sql.gz`), plus the
 `corpus-id`, `corpus-label`, `max-flips-listed`). Outputs: `baseline` (the
 resolved tag), `baseline-sha`, `baseline-source`, `flips`, `compared`,
 `only-in-baseline`, `only-in-head`, `reason-diffs`, `snapshot-file` (this run's
-own snapshot, for the caller to upload), `baseline-snapshot-file`, and
-`report-markdown`. Results are written to the job summary as tables, with the
-full text report in a collapsed block.
+own snapshot, for the caller to upload), `baseline-snapshot-file`,
+`report-markdown` and `comment-marker`, plus the comparison against the
+release's original snapshot (see [Several snapshots per
+release](#several-snapshots-per-release)): `released-snapshot`,
+`released-state`, `released-flips`, `released-reason-diffs`,
+`harness-drift-flips` and `harness-drift-reason-diffs`. Results are written to
+the job summary as tables, with the full text report in a collapsed block.
 
 `report-markdown` is the same rendering as a file, ready to post as a
 pull-request comment — see the comment step in
@@ -273,9 +277,11 @@ pull-request comment — see the comment step in
 runs: a `pull_request` run sees just the bundled fixture and would report almost
 nothing. Since full-corpus runs are `prepare-*` pushes with no PR attached, the
 example takes the target PR number as a `workflow_dispatch` input. The report
-carries an `<!-- asb-detection-compare -->` marker so the step updates its own
-previous comment instead of adding one per run, and it skips fork PRs, which
-cannot be commented on with the default read-only token.
+starts with a marker naming the baseline (`comment-marker`, e.g.
+`<!-- asb-detection-compare baseline=3.0.0-beta.2 -->`), so the step updates its
+own previous comment for that baseline instead of adding one per run, while runs
+against other baselines keep a comment each. It skips fork PRs, which cannot be
+commented on with the default read-only token.
 
 ### Corpora
 
@@ -332,9 +338,9 @@ cannot serve as a false-positive check. Fork pull requests get the fixture becau
 they cannot read secrets.
 
 Each corpus has its own fingerprint, so snapshots never collide: a release can
-carry `asb-snapshot-full-7f720ef3.tsv.gz` and
-`asb-snapshot-small-4eb1dc68.tsv.gz` side by side, and a run only ever finds the
-baseline matching the corpus it is classifying.
+carry `asb-snapshot-full-h80d6ff02e6e4-7f720ef3.tsv.gz` and
+`asb-snapshot-small-h1c0a5e2f9b47-4eb1dc68.tsv.gz` side by side, and a run only
+ever finds the baselines matching the corpus it is classifying.
 
 ### Baseline snapshots
 
@@ -414,6 +420,41 @@ was produced under, split by whether they can change a verdict:
   reported as a warning in the job summary, but not disqualifying. Pin
   `wp-version` in the consuming workflow so core releases do not quietly drift;
   bumping it invalidates every snapshot, which is the point.
+
+#### Several snapshots per release
+
+A mismatched snapshot is not reused, but it is not thrown away either. Most
+harness changes follow the plugin — the injection marker and the trusted-context
+filter exist because newer builds behave differently — so for an older release
+the harness of its time modelled it correctly, and its original snapshot records
+how that release was judged. That is exactly the baseline for the question "did
+any decision change?".
+
+So a release keeps every snapshot, one per set of conditions. The asset name
+carries the first 12 characters of the hard fingerprint in front of the corpus
+token (`asb-snapshot-<label>-h<hard_fp>-<token>.tsv.gz`); names from before this
+scheme (`asb-snapshot-<label>-<token>.tsv.gz`) still match the lookup and stay
+valid. `attach-snapshot-on-release.yml` never replaces an asset, and can be run
+by hand to attach the baseline snapshot a pull-request or manual run classified.
+
+Each run then compares HEAD against two baselines:
+
+- **Current harness** — the snapshot whose fingerprint matches, or the baseline
+  classified in this run. It gates `fail-on-flips`, and it is the only baseline
+  whose reason differences mean anything, since the harness decides which rules
+  a replay reaches.
+- **As released** — the oldest snapshot for the same commit, corpus, salt, shard
+  mode and option fixture, whatever harness produced it
+  (`scripts/pick-released-snapshot.php`). The report adds its flips against HEAD
+  and the **harness drift**: the flips and reason differences between it and the
+  current-harness baseline. Snapshots record their option fixture separately
+  (`options_fp`), so a run with the language rule on is never mistaken for an
+  earlier measurement of one without it.
+
+Drift of zero means the harness change did not move a single verdict for that
+build, and both comparisons say the same. Drift above zero is flagged: some
+harness fixes apply to every build, and then one of the two measurements was
+wrong for it — which one has to be decided before trusting either comparison.
 
 Corpus identity is computed from the *imported rows* (an order-independent
 checksum), not from the dump file: a dump regenerated by `mysqldump` has

@@ -11,6 +11,16 @@
 # the corpus row id, the spam/ham status, and the matched rule slugs. See
 # "Baseline snapshots" in the asb-detection-compare README.
 #
+# Snapshots are never replaced. Each asset name carries the short fingerprint of
+# the conditions it was produced under, so a release keeps one per harness: the
+# oldest is how the release was originally judged, a newer one lets runs under
+# the current harness skip classifying the baseline. An asset whose name already
+# exists describes the same experiment and is left alone.
+#
+# Run it by hand to attach the baseline snapshot a pull-request or manual
+# comparison classified: give the tag and the run id. That is how a release
+# gains a snapshot for a newer harness without being re-released.
+#
 # If no matching artifact exists (e.g. the release was cut without a prepare
 # run), this fails loudly. Nothing breaks downstream — the next comparison
 # simply classifies its baseline as it always did — but the failure is the
@@ -21,6 +31,14 @@ name: Attach detection snapshot to release
 on:
   release:
     types: [ published ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach the snapshot to.'
+        required: true
+      run_id:
+        description: 'Id of the comparison run whose baseline snapshot describes that tag.'
+        required: true
 
 permissions:
   contents: write        # needed to upload a release asset
@@ -46,11 +64,21 @@ jobs:
         id: find
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
           tag_sha="$(git rev-list -n 1 "$TAG")"
           echo "Release $TAG is commit $tag_sha"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # By hand: the given run classified this tag as its baseline.
+          if [ -n "$RUN_ID" ]; then
+            echo "run-id=$RUN_ID" >> "$GITHUB_OUTPUT"
+            echo "tag-sha=$tag_sha" >> "$GITHUB_OUTPUT"
+            echo "artifact=asb-detection-baseline-snapshot" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # The newest successful comparison run for exactly this commit.
           run_id="$(gh run list \
@@ -67,6 +95,7 @@ jobs:
           fi
           echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
           echo "tag-sha=$tag_sha" >> "$GITHUB_OUTPUT"
+          echo "artifact=asb-detection-snapshot" >> "$GITHUB_OUTPUT"
 
       - name: Download the snapshot artifact
         id: download
@@ -78,7 +107,7 @@ jobs:
           # prepared with only the full corpus has no small-corpus artifact.
           # That is not a failure; there is simply nothing to attach.
           if gh run download "${{ steps.find.outputs.run-id }}" \
-              --name "asb-detection-snapshot-${{ matrix.corpus }}" --dir snapshot 2>/dev/null; then
+              --name "${{ steps.find.outputs.artifact }}-${{ matrix.corpus }}" --dir snapshot 2>/dev/null; then
             echo "found=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::No ${{ matrix.corpus }}-corpus snapshot in that run; nothing to attach."
@@ -126,8 +155,18 @@ jobs:
         if: steps.download.outputs.found == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.find.outputs.tag }}
         run: |
           set -euo pipefail
-          gh release upload "${{ github.event.release.tag_name }}" \
-            "$SNAPSHOT_FILE" --clobber
-          echo "Attached $(basename "$SNAPSHOT_FILE") to ${{ github.event.release.tag_name }}."
+          name="$(basename "$SNAPSHOT_FILE")"
+
+          # Never replace a snapshot: the one already there may be the only
+          # record of how the release was originally judged. The same name means
+          # the same conditions, so there is nothing to add either.
+          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qxF "$name"; then
+            echo "::notice::$name is already attached to $TAG; leaving it as it is."
+            exit 0
+          fi
+
+          gh release upload "$TAG" "$SNAPSHOT_FILE"
+          echo "Attached $name to $TAG."
