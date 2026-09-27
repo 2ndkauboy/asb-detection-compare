@@ -360,6 +360,12 @@ if [ "$ASB_LANG_API" = "true" ]; then
 fi
 harness_fp="$(cat "${harness_files[@]}" | sha256sum | cut -d' ' -f1)"
 
+# The option fixture on its own, recorded in each snapshot. It is part of the
+# harness fingerprint too, but separately it tells an earlier measurement of the
+# same experiment (another harness) from a different experiment (other rules on),
+# which is what picking the "as released" baseline below needs.
+options_fp="$(sha256sum < "$OPTIONS_FILE" | cut -c1-16)"
+
 # The fingerprint is per commit: it answers "was this classification produced
 # from *this* plugin build under *these* conditions". The baseline's fingerprint
 # is what a published snapshot must match; HEAD's is what this run's own
@@ -389,12 +395,22 @@ corpus_token="$(ASB_CORPUS_FP="$corpus_fp" php -r \
 echo "Corpus: $CORPUS_LABEL/$corpus_token  |  conditions: ${hard_fp:0:12}"
 
 # ---------------------------------------------------------------------------
-# 6. Try to use a published baseline snapshot instead of classifying twice.
+# 6. Try to use a published baseline snapshot instead of classifying twice, and
+#    find the snapshot the baseline release was originally judged by.
+#
+# A release can carry several snapshots per corpus, one per set of conditions
+# (the short hard fingerprint is part of the asset name). Only an exact match may
+# stand in for classifying the baseline again. The oldest snapshot for the same
+# commit, corpus, salt, shard mode and option fixture is the "as released" one,
+# whatever harness produced it: how that release classified the corpus when the
+# harness of its time modelled it. HEAD is compared against both.
 # ---------------------------------------------------------------------------
 BASE_SNAPSHOT=""
+RELEASED_SNAPSHOT=""
 baseline_source="classified"
 drift_notes=""
-candidate=""
+candidates=()
+released_dir=""
 
 # A snapshot handed to us directly (local debugging, a self-hosted setup, or the
 # self-test) short-circuits the release lookup but goes through the same checks.
@@ -406,15 +422,17 @@ if [ -n "${ASB_BASELINE_SNAPSHOT:-}" ]; then
 		echo "ASB_BASELINE_SNAPSHOT does not exist: $ASB_BASELINE_SNAPSHOT" >&2
 		exit 1
 	fi
-	candidate="$ASB_BASELINE_SNAPSHOT"
+	candidates=( "$ASB_BASELINE_SNAPSHOT" )
 elif [ "$ASB_USE_BASELINE_SNAPSHOT" = "true" ] && [ "$baseline_is_tag" = "true" ] \
 	&& [ -n "$ASB_SNAPSHOT_REPO" ] && command -v gh >/dev/null; then
-	log "Looking for a published baseline snapshot on release '$ASB_BASELINE_REF'"
+	log "Looking for published baseline snapshots on release '$ASB_BASELINE_REF'"
 	dl_dir="$WORK/baseline-snapshot"
 	mkdir -p "$dl_dir"
 	if gh release download "$ASB_BASELINE_REF" --repo "$ASB_SNAPSHOT_REPO" \
 		--pattern "asb-snapshot-*-${corpus_token}.tsv.gz" --dir "$dl_dir" 2>&1; then
-		candidate="$(find "$dl_dir" -name '*.tsv.gz' -type f | head -1)"
+		mapfile -t candidates < <(find "$dl_dir" -name '*.tsv.gz' -type f | sort)
+		released_dir="$dl_dir"
+		echo "Found ${#candidates[@]} snapshot(s) for this corpus."
 	else
 		echo "No matching snapshot asset on that release."
 	fi
@@ -424,17 +442,39 @@ elif [ "$ASB_USE_BASELINE_SNAPSHOT" = "true" ] && ! command -v gh >/dev/null; th
 	echo "The gh CLI is not available — cannot look for a published baseline snapshot."
 fi
 
-# However the candidate arrived, it faces the same checks: right experiment,
-# right salt, and a note about anything that drifted but does not invalidate it.
-if [ -n "$candidate" ]; then
+# However a candidate arrived, it faces the same checks: right experiment, right
+# salt, and a note about anything that drifted but does not invalidate it.
+for candidate in "${candidates[@]}"; do
+	echo "Candidate: $(basename "$candidate")"
 	if php "$ASB_ACTION_DIR/scripts/verify-snapshot.php" \
 		--file="$candidate" --hard-fp="$hard_fp" --salt-check="$salt_check" \
 		--soft="$soft_json" > "$WORK/verify.txt"; then
 		BASE_SNAPSHOT="$candidate"
 		baseline_source="release-asset"
 		drift_notes="$(grep '^Baseline snapshot drift:' "$WORK/verify.txt" || true)"
+		cat "$WORK/verify.txt"
+		break
 	fi
 	cat "$WORK/verify.txt"
+done
+
+# The "as released" snapshot: supplied directly, or picked from the release.
+pick_released() {
+	php "$ASB_ACTION_DIR/scripts/pick-released-snapshot.php" "$1" \
+		--commit="$baseline_sha" --salt-check="$salt_check" --token="$corpus_token" \
+		--shard-mode="$SHARD_MODE" --options-fp="$options_fp"
+}
+if [ -n "${ASB_RELEASED_SNAPSHOT:-}" ]; then
+	if [ ! -f "$ASB_RELEASED_SNAPSHOT" ]; then
+		echo "ASB_RELEASED_SNAPSHOT does not exist: $ASB_RELEASED_SNAPSHOT" >&2
+		exit 1
+	fi
+	RELEASED_SNAPSHOT="$(pick_released --file="$ASB_RELEASED_SNAPSHOT")"
+elif [ -n "$released_dir" ]; then
+	RELEASED_SNAPSHOT="$(pick_released --dir="$released_dir")"
+fi
+if [ -n "$RELEASED_SNAPSHOT" ]; then
+	echo "As released: $(basename "$RELEASED_SNAPSHOT")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -478,13 +518,14 @@ export_snapshot() {
 	local out="$1" ref="$2" sha="$3"
 	local meta
 	meta="$(ASB_M_REF="$ref" ASB_M_SHA="$sha" ASB_M_HARD="$(hard_fp_for "$sha")" ASB_M_TOKEN="$corpus_token" \
-		ASB_M_SHARD="$SHARD_MODE" ASB_M_SOFT="$soft_json" php -r \
+		ASB_M_SHARD="$SHARD_MODE" ASB_M_OPTIONS="$options_fp" ASB_M_SOFT="$soft_json" php -r \
 		'echo json_encode([
 			"ref"           => getenv("ASB_M_REF"),
 			"commit_sha"    => getenv("ASB_M_SHA"),
 			"hard_fp"       => getenv("ASB_M_HARD"),
 			"corpus_token"  => getenv("ASB_M_TOKEN"),
 			"shard_mode"    => getenv("ASB_M_SHARD"),
+			"options_fp"    => getenv("ASB_M_OPTIONS"),
 			"soft"          => json_decode(getenv("ASB_M_SOFT"), true),
 		]);')"
 	DB_PASS="$DB_ROOT_PASS" php "$ASB_ACTION_DIR/scripts/export-snapshot.php" \
@@ -495,7 +536,11 @@ export_snapshot() {
 
 # HEAD first: its snapshot is the one this run publishes.
 head_sha="$(git -C "$ASB_PLUGIN_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
-HEAD_SNAPSHOT="$SNAP_OUT/asb-snapshot-${CORPUS_LABEL}-${corpus_token}.tsv.gz"
+# The short hard fingerprint in the name keeps snapshots from different conditions
+# apart on a release. It goes in front of the corpus token, so the lookup pattern
+# and the consumers' "ends in -<token>.tsv.gz" check work for both name forms.
+head_hard_fp="$(hard_fp_for "$head_sha")"
+HEAD_SNAPSHOT="$SNAP_OUT/asb-snapshot-${CORPUS_LABEL}-h${head_hard_fp:0:12}-${corpus_token}.tsv.gz"
 classify head "$ASB_PLUGIN_DIR"
 export_snapshot "$HEAD_SNAPSHOT" "$ASB_BRANCH" "$head_sha"
 
@@ -507,7 +552,7 @@ if [ -z "$BASE_SNAPSHOT" ]; then
 	# Worth publishing only when the baseline is a tag: the lookup only ever
 	# queries releases, and a branch tip moves so its verdicts are not reusable.
 	if [ "$baseline_is_tag" = "true" ]; then
-		BASE_SNAPSHOT="$BASE_OUT/asb-snapshot-${CORPUS_LABEL}-${corpus_token}.tsv.gz"
+		BASE_SNAPSHOT="$BASE_OUT/asb-snapshot-${CORPUS_LABEL}-h${hard_fp:0:12}-${corpus_token}.tsv.gz"
 	else
 		BASE_SNAPSHOT="$WORK/baseline.tsv.gz"
 	fi
@@ -542,6 +587,51 @@ compared="$(stat_of compared)"
 only_in_baseline="$(stat_of only_in_old)"
 only_in_head="$(stat_of only_in_new)"
 reason_diffs="$(stat_of reason_diffs)"
+
+# Against the "as released" snapshot: HEAD vs. how the release was judged, and
+# the current-harness baseline vs. that original (the harness drift). Skipped
+# when the original was taken under the current conditions — then it is the
+# baseline already.
+released_state="none"
+released_flips=""
+released_reason_diffs=""
+drift_flips=""
+drift_reason_diffs=""
+released_asset=""
+released_date=""
+compare_snapshots() {
+	local old_file="$1" old_label="$2" new_file="$3" new_label="$4" out="$5"
+	ASB_OLD_FILE="$old_file" ASB_NEW_FILE="$new_file" \
+	ASB_OLD_LABEL="$old_label" ASB_NEW_LABEL="$new_label" \
+	ASB_MAX_FLIPS_LISTED="$ASB_MAX_FLIPS_LISTED" ASB_STATS_FILE="$out.json" \
+	ASB_REPORT_MD="$out.md" \
+	ASB_CORPUS_DB_NAME="$CORPUS_DB" ASB_CORPUS_DB_HOST="$DB_HOST" \
+	ASB_CORPUS_DB_PORT="$DB_PORT" ASB_CORPUS_DB_USER="$DB_ROOT_USER" \
+	ASB_CORPUS_DB_PASS="$DB_ROOT_PASS" ASB_CORPUS_PREFIX=wp_ \
+	ASB_CORPUS_SALT_FILE="$WORK/salt" \
+	php "$ASB_ACTION_DIR/lib/antispam-plugin-stat-comparer.php" > "$out.txt"
+}
+json_of() { php -r '$s=json_decode(file_get_contents($argv[1]),true); echo $s[$argv[2]] ?? 0;' "$1" "$2"; }
+manifest_of() {
+	php -r 'require getenv("ASB_LIB"); $m = asb_snapshot_manifest($argv[1]); echo (string) ($m[$argv[2]] ?? "");' "$1" "$2"
+}
+if [ -n "$RELEASED_SNAPSHOT" ]; then
+	released_asset="$(basename "$RELEASED_SNAPSHOT")"
+	released_date="$(manifest_of "$RELEASED_SNAPSHOT" created_at)"
+	if [ "$(manifest_of "$RELEASED_SNAPSHOT" hard_fp)" = "$hard_fp" ]; then
+		released_state="current"
+	else
+		released_state="compared"
+		log "Comparing the as-released $ASB_BASELINE_REF snapshot vs HEAD, and vs the current-harness baseline"
+		compare_snapshots "$RELEASED_SNAPSHOT" "$ASB_BASELINE_REF (as released)" "$HEAD_SNAPSHOT" "HEAD" "$WORK/released"
+		compare_snapshots "$RELEASED_SNAPSHOT" "$ASB_BASELINE_REF (as released)" "$BASE_SNAPSHOT" "$ASB_BASELINE_REF (current harness)" "$WORK/drift"
+		released_flips="$(json_of "$WORK/released.json" spam_flips)"
+		released_reason_diffs="$(json_of "$WORK/released.json" reason_diffs)"
+		drift_flips="$(json_of "$WORK/drift.json" spam_flips)"
+		drift_reason_diffs="$(json_of "$WORK/drift.json" reason_diffs)"
+		cat "$WORK/released.txt" "$WORK/drift.txt"
+	fi
+fi
 
 # ---------------------------------------------------------------------------
 # 9. Offer the snapshots to the caller, but only if they are safe to publish.
@@ -601,10 +691,12 @@ else
 fi
 
 # One rendering, used for both the job summary and any pull-request comment. The
-# marker lets a comment be updated in place instead of posted again per run.
+# marker lets a comment be updated in place instead of posted again per run. It
+# names the baseline, so runs against different baselines keep a comment each.
+COMMENT_MARKER="<!-- asb-detection-compare baseline=$ASB_BASELINE_REF -->"
 REPORT_MD="$REPORT_DIR/report.md"
 {
-	echo "<!-- asb-detection-compare -->"
+	echo "$COMMENT_MARKER"
 	echo "## Antispam Bee spam-detection comparison"
 	echo
 	echo "| | |"
@@ -618,7 +710,25 @@ REPORT_MD="$REPORT_DIR/report.md"
 	if [ "$only_in_baseline" != "0" ] || [ "$only_in_head" != "0" ]; then
 		echo "| **Only one side** | $only_in_baseline / $only_in_head |"
 	fi
+	case "$released_state" in
+		compared)
+			echo "| **As released** | \`$released_asset\` (built ${released_date:-at an unknown date}) |"
+			echo "| **Flips vs. as released** | **$released_flips** ($released_reason_diffs reason-only) |"
+			echo "| **Harness drift** | $drift_flips flips, $drift_reason_diffs reason-only differences |"
+			;;
+		current)
+			echo "| **As released** | same conditions as the baseline above (\`$released_asset\`) |"
+			;;
+		*)
+			echo "| **As released** | no earlier snapshot of \`$ASB_BASELINE_REF\` for this corpus |"
+			;;
+	esac
 	echo
+	if [ "$released_state" = "compared" ] && [ "$drift_flips" != "0" ]; then
+		echo "> [!WARNING]"
+		echo "> The current harness classifies \`$ASB_BASELINE_REF\` differently than the harness its original snapshot was taken with ($drift_flips spam/ham flips). One of the two measurements is wrong for that build; check which before trusting either comparison."
+		echo
+	fi
 	if [ -n "$drift_notes" ]; then
 		echo "> [!WARNING]"
 		while IFS= read -r line; do
@@ -628,6 +738,20 @@ REPORT_MD="$REPORT_DIR/report.md"
 	fi
 	cat "$WORK/comparison.md"
 	echo
+	if [ "$released_state" = "compared" ]; then
+		echo "<details><summary>HEAD vs. $ASB_BASELINE_REF as released</summary>"
+		echo
+		cat "$WORK/released.md"
+		echo
+		echo "</details>"
+		echo
+		echo "<details><summary>Harness drift: $ASB_BASELINE_REF as released vs. under the current harness</summary>"
+		echo
+		cat "$WORK/drift.md"
+		echo
+		echo "</details>"
+		echo
+	fi
 	echo "<sub>Flips are the signal: the two builds disagree on spam vs. ham."
 	echo "Reason-only differences mean the same decision reached via different rules.</sub>"
 } > "$REPORT_MD"
@@ -645,6 +769,13 @@ if [ -n "${GITHUB_OUTPUT:-}" ]; then
 		echo "reason-diffs=$reason_diffs"
 		echo "snapshot-file=$snapshot_out"
 		echo "baseline-snapshot-file=$baseline_snapshot_out"
+		echo "comment-marker=$COMMENT_MARKER"
+		echo "released-snapshot=$released_asset"
+		echo "released-state=$released_state"
+		echo "released-flips=$released_flips"
+		echo "released-reason-diffs=$released_reason_diffs"
+		echo "harness-drift-flips=$drift_flips"
+		echo "harness-drift-reason-diffs=$drift_reason_diffs"
 	} >> "$GITHUB_OUTPUT"
 fi
 

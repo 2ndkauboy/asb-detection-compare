@@ -136,9 +136,41 @@ outputs:
   report-markdown:
     description: >-
       Path to the comparison report rendered as Markdown, ready to post as a
-      pull-request comment. Carries an `asb-detection-compare` HTML marker so a
-      comment can be updated in place rather than posted again per run.
+      pull-request comment. Starts with the `comment-marker` so a comment can be
+      updated in place rather than posted again per run.
     value: ${{ steps.compare.outputs.report-markdown }}
+  comment-marker:
+    description: >-
+      The HTML marker the report starts with. It names the baseline, so match a
+      comment on it to keep one comment per baseline instead of one per PR.
+    value: ${{ steps.compare.outputs.comment-marker }}
+  released-snapshot:
+    description: >-
+      Asset name of the snapshot the baseline release was originally judged by
+      (the oldest one for this commit, corpus, salt, shard mode and option
+      fixture, whatever harness produced it). Empty when there is none.
+    value: ${{ steps.compare.outputs.released-snapshot }}
+  released-state:
+    description: >-
+      "compared" when HEAD was also compared against that snapshot, "current"
+      when it was taken under this run's conditions (so it is the baseline
+      already), "none" when there is no such snapshot.
+    value: ${{ steps.compare.outputs.released-state }}
+  released-flips:
+    description: 'Spam/ham flips between the as-released snapshot and HEAD (empty unless released-state is "compared").'
+    value: ${{ steps.compare.outputs.released-flips }}
+  released-reason-diffs:
+    description: 'Reason-only differences between the as-released snapshot and HEAD.'
+    value: ${{ steps.compare.outputs.released-reason-diffs }}
+  harness-drift-flips:
+    description: >-
+      Spam/ham flips between the as-released snapshot and the baseline under the
+      current harness. Anything but 0 means the two harnesses disagree about the
+      same build.
+    value: ${{ steps.compare.outputs.harness-drift-flips }}
+  harness-drift-reason-diffs:
+    description: 'Reason-only differences between the as-released snapshot and the current-harness baseline.'
+    value: ${{ steps.compare.outputs.harness-drift-reason-diffs }}
   baseline-snapshot-file:
     description: >-
       Path to the baseline's verdict snapshot, when the baseline was a tag and had

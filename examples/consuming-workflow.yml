@@ -185,7 +185,8 @@ jobs:
 
       # Post the result on a PR. Skipped for fixture runs, which compare 112
       # synthetic comments and would report almost nothing. Updates its own
-      # comment in place instead of adding one per run.
+      # comment for the same baseline in place instead of adding one per run;
+      # runs against other baselines keep a comment each.
       #
       # `always()` so a failing check (flips found) still reports: that is exactly
       # the case someone needs the table for.
@@ -195,6 +196,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ inputs.comment_pr }}
           REPORT: ${{ steps.compare.outputs.report-markdown }}
+          MARKER: ${{ steps.compare.outputs.comment-marker }}
         run: |
           set -euo pipefail
 
@@ -206,9 +208,9 @@ jobs:
             exit 0
           fi
 
-          # Reuse our own previous comment when there is one.
+          # Reuse our own previous comment for this baseline when there is one.
           existing="$(gh api "repos/${{ github.repository }}/issues/$PR/comments" --paginate \
-            --jq 'map(select(.body | contains("<!-- asb-detection-compare -->"))) | last | .id // empty')"
+            | jq -rs --arg marker "$MARKER" 'add | map(select(.body | startswith($marker))) | last | .id // empty')"
 
           if [ -n "$existing" ]; then
             gh api --method PATCH "repos/${{ github.repository }}/issues/comments/$existing" \

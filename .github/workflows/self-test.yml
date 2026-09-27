@@ -73,6 +73,9 @@ jobs:
           SECOND_SOURCE: ${{ steps.reuse.outputs.baseline-source }}
           FIRST_COMPARED: ${{ steps.first.outputs.compared }}
           SECOND_COMPARED: ${{ steps.reuse.outputs.compared }}
+          FIRST_MARKER: ${{ steps.first.outputs.comment-marker }}
+          FIRST_RELEASED: ${{ steps.first.outputs.released-state }}
+          FIRST_SNAPSHOT_NAME: ${{ steps.first.outputs.snapshot-file }}
         run: |
           set -euo pipefail
           fail=0
@@ -88,6 +91,13 @@ jobs:
           expect "first run classified its baseline"  "$FIRST_SOURCE"  "classified"
           expect "second run reused the snapshot"     "$SECOND_SOURCE" "release-asset"
           expect "both runs compared the same corpus" "$SECOND_COMPARED" "$FIRST_COMPARED"
+          expect "the comment marker names the baseline" "$FIRST_MARKER" "<!-- asb-detection-compare baseline=3.0.0-beta.1 -->"
+          expect "no earlier snapshot of the baseline"  "$FIRST_RELEASED" "none"
+
+          # Snapshots from different conditions must not collide on a release,
+          # and the name must still end in -<corpus token>.tsv.gz for consumers.
+          named="$(basename "$FIRST_SNAPSHOT_NAME" | grep -cE '^asb-snapshot-[a-z]+-h[0-9a-f]{12}-[0-9a-f]{8}\.tsv\.gz$' || true)"
+          expect "the snapshot name carries the fingerprint" "$named" "1"
 
           # A published snapshot must never carry raw corpus ids or any content:
           # every key is a 16-hex pseudonym, and the payload is a status plus
