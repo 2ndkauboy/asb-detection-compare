@@ -235,9 +235,25 @@ if ( ! $target_post ) {
 	asb_driver_die( "Target post #$target_post_id does not exist on this site." );
 }
 
+/*
+ * Render the target post's comment form once, as a visitor's page view would.
+ * Nothing else in a replay renders it, and Antispam Bee builds from
+ * 3.0.0-beta.4 on only reject a submission without the honeypot's secret field
+ * after seeing that field placed into a rendered form. Without this every bot
+ * replayed from the `css` cohort would draw no verdict there. Builds that do not
+ * keep such a state are unaffected by the extra render.
+ */
+ob_start();
+comment_form( [], $target_post_id );
+ob_end_clean();
+
+$injection_state = method_exists( '\AntispamBee\Helpers\Honeypot', 'injection_observed' )
+	? ( \AntispamBee\Helpers\Honeypot::injection_observed() ? 'observed' : 'NOT observed' )
+	: 'n/a';
+
 asb_driver_log(
 	sprintf(
-		'ASB %s | worker %d/%d | source %s.%scomments | honeypot field "%s" | marker field %s | target post #%d | DbSpam: %s',
+		'ASB %s | worker %d/%d | source %s.%scomments | honeypot field "%s" | marker field %s | honeypot in rendered form: %s | target post #%d | DbSpam: %s',
 		$asb_version,
 		$worker_index,
 		$worker_count,
@@ -245,6 +261,7 @@ asb_driver_log(
 		$src_prefix,
 		$secret_name,
 		null === $marker_name ? '(none)' : '"' . $marker_name . '"',
+		$injection_state,
 		$target_post_id,
 		$disable_db_spam ? 'DISABLED' : 'enabled'
 	)
@@ -460,20 +477,25 @@ while ( true ) {
 				'url'             => wp_slash( $url ),
 				'comment_post_ID' => (string) $target_post_id,
 			];
-			if ( null !== $marker_name ) {
-				/*
-				 * Every form the honeypot was injected into carries this marker, and
-				 * the rule only judges a submission that has it: without it the
-				 * secret field is never swapped back into `comment` and the
-				 * submission is rejected as empty, and a form the plugin never
-				 * touched draws no verdict at all.
-				 */
-				$_POST[ $marker_name ] = '1';
-			}
 			if ( 'css' === $reason ) {
-				// Historically caught via the visible (decoy) field: leave content there.
+				/*
+				 * Historically caught by the honeypot: replay it the way such a bot
+				 * posts - the fields core expects, text in the decoy `comment`, and
+				 * none of the fields the plugin renders into its form. In particular
+				 * no marker: a bot that never used the form cannot send one, so
+				 * adding it would test a submission no bot makes.
+				 */
 				$_POST['comment'] = wp_slash( $content );
 			} else {
+				if ( null !== $marker_name ) {
+					/*
+					 * A genuine submission comes from the rendered form, and on builds
+					 * that emit a marker every form the honeypot was injected into
+					 * carries it. Without it those builds never swap the secret field
+					 * back into `comment`, and the comment is rejected as empty.
+					 */
+					$_POST[ $marker_name ] = '1';
+				}
 				// Legit-looking submission: content in the hashed field, decoy empty,
 				// so the honeypot passes and the remaining rules decide the verdict.
 				$_POST['comment']      = '';
