@@ -496,6 +496,28 @@ classify() {
 		echo "  ! '$label' is not a 3.x build (no src/); no option fixture applied." >&2
 	fi
 
+	# Render the comment form once, sequentially, before the workers start.
+	#
+	# The honeypot secret (antispam_bee_honeypot_secret) and injection-state flag
+	# (antispam_bee_honeypot_injection) are both "generate/read once, shared
+	# site-wide" by design: a real site has exactly one of each, created on first
+	# use. This harness breaks that assumption by having $WORKERS separate
+	# processes race to be the first visitor to a freshly installed, otherwise
+	# idle site. The result has been observed CI flakes where the first classify()
+	# pass intermittently logs the honeypot as "NOT observed" for some workers
+	# (https://github.com/pluginkollektiv/antispam-bee/pull/852), which then
+	# misclassifies honeypot-only spam as ham for whichever workers raced to be
+	# first. The second pass in the same job, against the same already-primed
+	# site, has never reproduced it.
+	#
+	# Doing the same render here, once, single-threaded, before any worker
+	# starts, means both values already exist as ordinary rows by the time the
+	# workers run: each worker's own read/write becomes a plain update to an
+	# existing option instead of a multi-way race to create one. This changes
+	# nothing about what is being measured — the workers still each render and
+	# check their own result independently.
+	wp eval 'ob_start(); comment_form( [], 1 ); ob_end_clean();'
+
 	wp db query "TRUNCATE wp_comments; TRUNCATE wp_commentmeta; UPDATE wp_posts SET comment_count=0 WHERE ID=1;"
 
 	local i pids=()

@@ -86,6 +86,14 @@ else
 	echo "    Add config/antispam_bee.2x.json and extend this script before comparing 2.x." >&2
 fi
 
+echo "== [$LABEL] prime the honeypot secret + injection state (single-threaded) =="
+# Both are "generate/read once, shared site-wide" by design — see ci-compare.sh
+# for why letting $WORKERS processes race to create them first is what causes
+# the intermittent "honeypot NOT observed" CI flakes (pluginkollektiv/antispam-bee#852).
+# Rendering the form once here, before any worker starts, means both already
+# exist as ordinary rows by the time the workers run.
+wp-env run cli wp eval 'ob_start(); comment_form( [], 1 ); ob_end_clean();'
+
 echo "== [$LABEL] truncate live tables =="
 wp-env run cli wp db query "TRUNCATE wp_comments; TRUNCATE wp_commentmeta; UPDATE wp_posts SET comment_count=0 WHERE ID=1;"
 
